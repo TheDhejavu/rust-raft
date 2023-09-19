@@ -29,10 +29,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
-
-      # Coverage for Rust
-      - name: Install cargo-tarpaulin (for coverage)
-        run: cargo install cargo-tarpaulin
-
-      - name: Test with coverage
-        run: cargo tarpaulin --out Xml
