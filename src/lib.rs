@@ -2,7 +2,9 @@ use std::str::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::thread;
+use fsm::FSM;
 use rand::Rng;
+use storage::LogStore;
 use crate::{log::LogEntry, state::NodeState};
 use crate::rpc_message::{
     AppendEntriesRequest, AppendEntriesResponse,
@@ -20,48 +22,36 @@ mod errors;
 mod disk;
 mod mocks;
 
-#[derive(Default)]
 struct RaftNode {
-    id:  u64,
-    leader_id: Option< u64>,
+    id: u64,
+    leader_id: Option<u64>,
     state: NodeState,
     votes: u64,
     peers: Vec<Arc<Mutex<RaftNode>>>,
 
     // persisted state for all servers
-    voted_for:  Option< u64>,
+    voted_for: Option<u64>,
     log: Vec<LogEntry>,
-    current_term:  u64,
+    current_term: u64,
 
     // volatile state
-    commit_index:  u64,
-    last_applied:  u64,
+    commit_index: u64,
+    last_applied: u64,
 
     // volatile state on leaders
-    next_index:  u64,
+    next_index: u64,
 
     election_timeout: Duration,
-}
 
-#[derive(Debug)]
-pub struct Peer {
-    pub id: u64,
-    pub addr: String,
-    pub next_index: u64,  
-    pub match_index: u64,
-}
-
-#[derive(Default)]
-struct RequestVoteResult {
-    term:  u64,
-    vote_granted: bool,
+    fsm: Box<dyn FSM>,
+    logs: Box<dyn LogStore>,
 }
 
 impl RaftNode {
-    fn new(id:  u64, peers: Vec<Arc<Mutex<RaftNode>>>) -> RaftNode {
+    fn new(id: u64, peers: Vec<Arc<Mutex<RaftNode>>>, fsm: Box<dyn FSM>, logs: Box<dyn LogStore>) -> RaftNode {
         let election_timeout = rand::thread_rng().gen_range(Duration::from_secs(60)..Duration::from_secs(600));
 
-        return RaftNode {
+        RaftNode {
             id,
             current_term: 0,
             leader_id: None,
@@ -71,11 +61,14 @@ impl RaftNode {
             log: vec![],
             commit_index: 0,
             voted_for: None,
-            last_applied:0,
+            last_applied: 0,
             next_index: 0,
-            election_timeout:  election_timeout,
+            election_timeout,
+            fsm,
+            logs,
         }
     }
+
 
     fn become_leader(&mut self) {
         self.state = NodeState::Leader;
@@ -148,7 +141,7 @@ impl RaftNode {
         least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)    
     */
 
-    fn handle_request_vote(&mut self, args: RequestVoteRequest) -> RequestVoteResponse {
+    fn request_vote(&mut self, args: RequestVoteRequest) -> RequestVoteResponse {
         // Check if term is outdated
         if args.term < self.current_term {
             return RequestVoteResponse {
