@@ -3,6 +3,7 @@ name = "rust-raft"
 version = "0.1.0"
 edition = "2021"
 
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -15,3 +16,10 @@ sled = "0.34.7"
 tempfile = "3.8.0"
 log = "0.4"
 thiserror = "1.0.48"
+tonic = "0.10.0"
+prost = "0.12.1"
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+[build-dependencies]
+tonic-build = "0.10.0"
