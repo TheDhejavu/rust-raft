@@ -1,3 +1,4 @@
+use log::error;
 use tonic::{Request, Response, Status, transport::{Channel, Server, Endpoint}};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
@@ -31,7 +32,7 @@ impl RaftGrpcTransport {
         let endpoint_addr = format_endpoint_addr(addr);
         let endpoint = Endpoint::from_shared(endpoint_addr)?;
         let channel = endpoint.connect().await?;
-        let client = RaftGrpcTransportClient::new(channel);
+        let client: RaftGrpcTransportClient<Channel> = RaftGrpcTransportClient::new(channel);
         Ok(RaftGrpcTransport { client: Arc::new(Mutex::new(client)) })
     }
 }
@@ -65,18 +66,17 @@ impl RaftGrpcTransportServer {
 
         // Just spawn the server task and don't wait on it
         tokio::spawn(async move {
-            if let Err(e) = Server::builder()
+            Server::builder()
                 .add_service(raft_grpc_transport_server::RaftGrpcTransportServer::new(self))
                 .serve(server_addr)
-                .await {
-                    eprintln!("Server error: {}", e);
-                }
+                .await.expect("unable to start up grpc server");
         });
         sleep(Duration::from_millis(100)).await;
 
-        println!("Server scheduled to start on {}", addr);
+       error!("Server scheduled to start on {}", addr);
         Ok(())
     }
+
 }
 
 #[async_trait]
@@ -84,21 +84,33 @@ impl raft_grpc_transport_server::RaftGrpcTransport for RaftGrpcTransportServer {
     
     async fn append_entries(&self, request: Request<AppendEntriesRequest>) -> Result<Response<AppendEntriesResponse>, Status> {
         let (response_sender, mut response_receiver) = mpsc::channel(1);
-        let _ = self.rpc_send_channel.send((RaftTransportRequest::AppendEntries(request.into_inner()), response_sender)).await;
-
-        match response_receiver.recv().await {
-            Some(RaftTransportResponse::AppendEntries(res)) => Ok(Response::new(res)),
-            _ => Err(Status::internal("Unexpected response type"))
+        match self.rpc_send_channel.send((RaftTransportRequest::AppendEntries(request.into_inner()), response_sender)).await {
+            Ok(_) => {
+                match response_receiver.recv().await {
+                    Some(RaftTransportResponse::AppendEntries(res)) => Ok(Response::new(res)),
+                   _ => Err(Status::internal("Received unexpected response type")),
+                }
+            },
+            Err(e) =>  {
+                error!("Unable to process append entries request: {}", e);
+                Err(Status::internal(format!("Unable to process append entries request: {}", e)))
+            }
         }
     }
 
     async fn request_vote(&self, request: Request<RequestVoteRequest>) -> Result<Response<RequestVoteResponse>, Status> {
         let (response_sender, mut response_receiver) = mpsc::channel(1);
-        let _ = self.rpc_send_channel.send((RaftTransportRequest::RequestVote(request.into_inner()), response_sender)).await;
-
-        match response_receiver.recv().await {
-            Some(RaftTransportResponse::RequestVote(res)) => Ok(Response::new(res)),
-            _ => Err(Status::internal("Unexpected response type"))
+        match self.rpc_send_channel.send((RaftTransportRequest::RequestVote(request.into_inner()), response_sender)).await{
+            Ok(_) => {
+                match response_receiver.recv().await {
+                    Some(RaftTransportResponse::RequestVote(res)) => Ok(Response::new(res)),
+                    _ => Err(Status::internal("Unexpected response type"))
+                }
+            },
+            Err(e) =>  {
+                error!("Unable to process request vote request: {}", e);
+                Err(Status::internal(format!("Unable to process request vote request: {}", e)))
+            }
         }
     }
 }
@@ -110,32 +122,42 @@ mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
-    #[tokio::test]
-    async fn test_append_entries() {
-        // Setup server
-        let (send, mut recv) = mpsc::channel::<(RaftTransportRequest, mpsc::Sender<RaftTransportResponse>)>(1);
+    async fn setup_server(server_addr: &str) -> mpsc::Receiver<(RaftTransportRequest, mpsc::Sender<RaftTransportResponse>)> {
+        let (send, recv) = mpsc::channel::<(RaftTransportRequest, mpsc::Sender<RaftTransportResponse>)>(1);
         let server = RaftGrpcTransportServer::new(send);
-        let server_addr = "[::]:50051";
-       
-        let result = server.run(server_addr).await.is_ok();
-        assert_eq!(result, true, "failed to start server");
+        assert_eq!(server.run(server_addr).await.is_ok(), true, "Failed to start server");
+        recv
+    }
 
-        // set up request listerners on the handler
+    async fn setup_client(server_addr: &str) -> RaftGrpcTransport {
+        RaftGrpcTransport::new(server_addr).await.expect("Failed to create client")
+    }
+
+    async fn spawn_request_listener(
+        mut recv: mpsc::Receiver<(RaftTransportRequest, mpsc::Sender<RaftTransportResponse>)>,
+        response_type: RaftTransportResponse,
+    ) {
         tokio::spawn(async move {
-            if let Some((RaftTransportRequest::AppendEntries(req), response_sender)) = recv.recv().await {
-                let response = AppendEntriesResponse {
-                    term: req.term,
-                    success: true,
-                };
-                response_sender.send(RaftTransportResponse::AppendEntries(response)).await.expect("Failed to send response");
+            if let Some((_, response_sender)) = recv.recv().await {
+                response_sender.send(response_type).await.expect("Failed to send response");
             }
         });
+    }
 
-        // setup client
-        let client_transport = RaftGrpcTransport::new(server_addr).await.expect("Failed to create client");
-        
-        // create a request
-        let request = AppendEntriesRequest {
+    #[tokio::test]
+    async fn test_append_entries() {
+        let server_addr = "[::]:50051";
+        let  recv = setup_server(server_addr).await;
+
+        let append_entries_response: AppendEntriesResponse = AppendEntriesResponse {
+            term: 1,
+            success: true,
+        };
+        spawn_request_listener(recv, RaftTransportResponse::AppendEntries(append_entries_response)).await;
+
+        let client_transport: RaftGrpcTransport = setup_client(server_addr).await;
+
+        let request: AppendEntriesRequest = AppendEntriesRequest {
             term: 1,
             leader_id: 2,
             prev_log_index: 3,
@@ -162,11 +184,35 @@ mod tests {
             ],
             commit_index: 3,
         };
-        
-        // Send request and await response
-        let response = client_transport.append_entries(request).await.expect("RPC failed");
+
+        let response: AppendEntriesResponse = client_transport.append_entries(request).await.expect("Append entries request failed");
         assert_eq!(response.success, true);
         assert_eq!(response.term, 1);
     }
 
+    #[tokio::test]
+    async fn test_request_vote() {
+        let server_addr = "[::]:50052";
+        let  recv = setup_server(server_addr).await;
+
+        let request_vote_response = RequestVoteResponse {
+            term: 1,
+            vote_granted: true,
+        };
+        spawn_request_listener(recv, RaftTransportResponse::RequestVote(request_vote_response)).await;
+
+        let client_transport: RaftGrpcTransport = setup_client(server_addr).await;
+
+        let request: RequestVoteRequest = RequestVoteRequest {
+            term: 1,
+            candidate_id: 1,
+            last_log_index: 10,
+            last_log_term: 1,
+            commit_index: 3,
+        };
+
+        let response = client_transport.request_vote(request).await.expect("Request vote request failed");
+        assert_eq!(response.vote_granted, true);
+        assert_eq!(response.term, 1);
+    }
 }
