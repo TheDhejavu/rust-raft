@@ -1,4 +1,4 @@
-use crate::{log::LogEntry,storage::LogStore, errors::StoreError};
+use crate::{log::LogEntry,storage::LogStore, error::StoreError};
 use std::collections::HashMap;
 
 pub struct MockLogStore {

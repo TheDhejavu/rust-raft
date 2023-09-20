@@ -1,15 +1,18 @@
 use std::str::Bytes;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use std::thread;
+use disk::RaftSledStore;
 use fsm::FSM;
 use rand::Rng;
-use storage::LogStore;
-use crate::{log::LogEntry, state::NodeState};
-use crate::rpc_message::{
+use storage::{LogStore, LogStorage};
+use crate::{state::NodeState};
+use crate::raft::{
+    LogEntry,
     AppendEntriesRequest, AppendEntriesResponse,
     RequestVoteRequest, RequestVoteResponse,
 };
+use crate::grpc_transport::{RaftGrpcTransport, RaftTransportResponse,RaftTransportRequest};
 
 mod configuration;
 mod log;
@@ -17,10 +20,15 @@ mod fsm;
 mod rpc_message;
 mod storage;
 mod state;
-mod transport;
-mod errors;
+mod grpc_transport;
+mod error;
+mod utils;
 mod disk;
 mod mocks;
+
+pub mod raft {
+    tonic::include_proto!("raft"); 
+}
 
 struct RaftNode {
     id: u64,
@@ -45,12 +53,15 @@ struct RaftNode {
 
     fsm: Box<dyn FSM>,
     logs: Box<dyn LogStore>,
+    grpc_transport: RaftGrpcTransport,
+    rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
 }
 
 impl RaftNode {
-    fn new(id: u64, peers: Vec<Arc<Mutex<RaftNode>>>, fsm: Box<dyn FSM>, logs: Box<dyn LogStore>) -> RaftNode {
+    fn new(id: u64, peers: Vec<Arc<Mutex<RaftNode>>>, fsm: Box<dyn FSM>, grpc_transport: RaftGrpcTransport , log_store: Box<dyn LogStore>, rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,) -> RaftNode {
         let election_timeout = rand::thread_rng().gen_range(Duration::from_secs(60)..Duration::from_secs(600));
-
+        let logs = Box::new(LogStorage::new(5, log_store).unwrap());
+        
         RaftNode {
             id,
             current_term: 0,
@@ -66,6 +77,8 @@ impl RaftNode {
             election_timeout,
             fsm,
             logs,
+            grpc_transport,
+            rpc_recv_channel,
         }
     }
 
@@ -97,7 +110,7 @@ impl RaftNode {
         5. If leaderCommit > commitIndex, set commitIndex =
         min(leaderCommit, index of last new entry)
     */
-    fn append_log_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
+    fn append_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
         // Check if term is outdated
         if args.term < self.current_term {
             return AppendEntriesResponse {
@@ -118,10 +131,10 @@ impl RaftNode {
 
         // Remove any conflicting entries and append new entries
         self.log.truncate(args.prev_log_index as usize + 1);
-        self.log.extend_from_slice(&args.entries);
+        self.log.extend_from_slice(&args.entries[..]);
 
-        if args.leader_commit_index > self.commit_index {
-            self.commit_index = args.leader_commit_index.min(self.log.len() as  u64 - 1);
+        if args.commit_index > self.commit_index {
+            self.commit_index = args.commit_index.min(self.log.len() as  u64 - 1);
         }
 
         // Update term and leader id
@@ -173,19 +186,55 @@ impl RaftNode {
             };
         }
 
-        self.voted_for = args.candidate_id;
+        self.voted_for = Some(args.candidate_id);
         return RequestVoteResponse {
             term: self.current_term,
             vote_granted: true,
         };
     }
-    fn start_election(){
 
+    async fn listen_for_requests(&mut self) {
+        while let Some((request, response_sender)) = self.rpc_recv_channel.recv().await {
+            match request {
+                RaftTransportRequest::AppendEntries(args) => {
+                    let response = self.append_entries(args);
+                    let _ = response_sender.send(RaftTransportResponse::AppendEntries(response)).await;
+                },
+                RaftTransportRequest::RequestVote(args) => {
+                    let response = self.request_vote(args);
+                    let _ = response_sender.send(RaftTransportResponse::RequestVote(response)).await;
+                },
+            }
+        }
     }
 
-    fn start_election_timeout(){
-        
+    fn spin_up_process(&mut self, state: NodeState) {}
+    fn run_follower_forever(&mut self) {
+        loop {
+            println!("Running as Follower...");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
     }
+    fn run_leader_forever(&mut self) {
+        loop {
+            println!("Running as Leader...");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    fn run_candidate_forever(&mut self) {
+        loop {
+            println!("Running as Candidate...");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+
+    fn run_fsm_forever(&mut self) {
+        loop {
+            println!("Running the FSM...");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+
 
 }
 

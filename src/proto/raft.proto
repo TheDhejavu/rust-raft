@@ -1,0 +1,46 @@
+syntax = "proto3";
+package raft;
+
+enum LogEntryType {
+    CommandLog = 0;
+    ConfigurationLog = 1;
+}
+
+message LogEntry {
+    uint64 index = 1;
+    uint64 term = 2;
+    LogEntryType log_entry_type = 3;
+    bytes data = 4;
+}
+
+message AppendEntriesRequest {
+    uint64 term = 1;
+    uint64 leader_id = 2;
+    uint64 prev_log_index = 3;
+    uint64 prev_log_term = 4;
+    repeated LogEntry entries = 5;
+    uint64 commit_index = 6;
+}
+
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+}
+
+message RequestVoteRequest {
+    uint64 term = 1;
+    uint64 candidate_id = 2; 
+    uint64 last_log_index = 3;
+    uint64 last_log_term = 4;
+    uint64 commit_index = 5;
+}
+
+message RequestVoteResponse {
+    uint64 term = 1;
+    bool vote_granted = 2;
+}
+
+service RaftGrpcTransport {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+}

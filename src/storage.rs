@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use crate::{log::LogEntry, errors::{RaftError, StoreError}};
+use crate::{log::LogEntry, error::{RaftError, StoreError}};
 
 pub trait LogStore: Send + Sync {
     fn get_log(&self, idx: u64) -> Option<LogEntry>;
@@ -12,7 +12,7 @@ pub trait LogStore: Send + Sync {
 
 pub struct LogStorage {
     store: Box<dyn LogStore>,
-    cache: Mutex<Vec<Option<Arc<LogEntry>>>>,  
+    cache: Mutex<Vec<Option<Arc<LogEntry>>>>,
 }
 
 impl LogStorage {
@@ -23,42 +23,47 @@ impl LogStorage {
 
         Ok(LogStorage {
             store,
-            cache: Mutex::new(vec![None; capacity]),  
+            cache: Mutex::new(vec![None; capacity]),
         })
     }
+}
 
-    pub fn get_log(&self, idx: u64) -> Option<LogEntry> {
-        let cached_idx = (idx % self.cache.lock().unwrap().len() as u64) as usize;
-        if let Some(log) = &self.cache.lock().unwrap()[cached_idx] {
+impl LogStore for LogStorage {
+    fn get_log(&self, idx: u64) -> Option<LogEntry> {
+        let cache = self.cache.lock().unwrap();
+        let cached_idx = (idx % cache.len() as u64) as usize;
+        if let Some(log) = &cache[cached_idx] {
             if log.index == idx {
                 return Some(log.clone().as_ref().clone());
             }
         }
+        drop(cache); 
         self.store.get_log(idx)
     }
 
-    pub fn store_log(&mut self, log: &LogEntry) {
-        self.store_logs(&[log.clone()]);
+    fn store_log(&mut self, log: &LogEntry) -> Result<(), StoreError> {
+        self.store_logs(&[log.clone()])
     }
 
-    pub fn store_logs(&mut self, logs: &[LogEntry]) {
-        self.store.store_logs(logs);
+    fn store_logs(&mut self, logs: &[LogEntry]) -> Result<(), StoreError> {
+        self.store.store_logs(logs)?;
         let mut cache = self.cache.lock().unwrap();
         for log in logs {
             let cached_idx = (log.index % cache.len() as u64) as usize;
-            cache[cached_idx] = Some(Arc::new(log.clone())); 
+            cache[cached_idx] = Some(Arc::new(log.clone()));
         }
+        Ok(())
     }
 
-    pub fn first_index(&self) -> u64 {
+    fn first_index(&self) -> u64 {
         self.store.first_index()
     }
 
-    pub fn last_index(&self) -> u64 {
+    fn last_index(&self) -> u64 {
         self.store.last_index()
     }
 
-    pub fn delete_range(&mut self, min_idx: u64, max_idx: u64) {
+    fn delete_range(&mut self, min_idx: u64, max_idx: u64) {
         let mut cache = self.cache.lock().unwrap();
         for idx in min_idx..=max_idx {
             let cached_idx = (idx % cache.len() as u64) as usize;
@@ -68,12 +73,11 @@ impl LogStorage {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{storage::LogStorage, log::LogEntryType,mocks::MockLogStore};
-    
+    use crate::{log::{LogEntry, LogEntryType}, mocks::MockLogStore};
+
     #[test]
     fn test_log_storage_operations() {
         let mock_store = Box::new(MockLogStore::new());
@@ -94,7 +98,7 @@ mod tests {
             },
         ];
 
-        logs.store_logs(&log_entries);
+        logs.store_logs(&log_entries).unwrap();
 
         // Test retrieval
         assert_eq!(logs.get_log(1).unwrap().index, 1);
@@ -103,7 +107,7 @@ mod tests {
 
         // Test deletion
         logs.delete_range(1, 1);
-        assert!(logs.get_log(1).is_none());  
+        assert!(logs.get_log(1).is_none());
         assert_eq!(logs.get_log(2).unwrap().index, 2);
 
         // Test first and last index

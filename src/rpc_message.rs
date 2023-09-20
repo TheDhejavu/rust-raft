@@ -16,7 +16,6 @@ pub struct AppendEntriesResponse {
     pub success: bool,
 }
 
-
 #[derive(Default)]
 pub struct RequestVoteRequest{
     pub term:  u64,

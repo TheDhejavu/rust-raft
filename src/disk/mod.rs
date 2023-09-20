@@ -1,6 +1,6 @@
 use sled::{Config, Db, IVec};
 use std::convert::TryInto;
-use crate::{log::LogEntry,storage::LogStore, errors::StoreError};
+use crate::{log::LogEntry,storage::LogStore, error::StoreError};
 
 pub struct RaftSledStore {
     db: Db,
