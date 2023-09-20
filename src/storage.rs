@@ -37,7 +37,7 @@ impl LogStore for LogStorage {
                 return Some(log.clone().as_ref().clone());
             }
         }
-        drop(cache);  // Explicitly drop the lock
+        drop(cache); 
         self.store.get_log(idx)
     }
 
