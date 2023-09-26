@@ -2,8 +2,10 @@ use std::str::Bytes;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 use std::thread;
+use config::Config;
 use disk::RaftSledStore;
 use fsm::FSM;
+use ::log::error;
 use rand::Rng;
 use storage::{LogStore, LogStorage};
 use crate::{state::NodeState};
@@ -15,6 +17,7 @@ use crate::raft::{
 use crate::grpc_transport::{RaftGrpcTransport, RaftTransportResponse,RaftTransportRequest};
 
 mod configuration;
+mod config;
 mod log;
 mod fsm;
 mod rpc_message;
@@ -31,6 +34,7 @@ pub mod raft {
 }
 
 struct RaftNode {
+    conf: Config,
     id: u64,
     leader_id: Option<u64>,
     state: NodeState,
@@ -58,11 +62,20 @@ struct RaftNode {
 }
 
 impl RaftNode {
-    fn new(id: u64, peers: Vec<Arc<Mutex<RaftNode>>>, fsm: Box<dyn FSM>, grpc_transport: RaftGrpcTransport , log_store: Box<dyn LogStore>, rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,) -> RaftNode {
-        let election_timeout = rand::thread_rng().gen_range(Duration::from_secs(60)..Duration::from_secs(600));
+    fn new(
+        conf: Config,
+        id: u64,
+        peers: Vec<Arc<Mutex<RaftNode>>>,
+        fsm: Box<dyn FSM>,
+        grpc_transport: RaftGrpcTransport,
+        log_store: Box<dyn LogStore>,
+        rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
+    ) -> RaftNode {
+        let election_timeout = rand::thread_rng().gen_range(Duration::from_secs(conf.election_timeout_min)..Duration::from_secs(conf.election_timeout_max));
         let logs = Box::new(LogStorage::new(5, log_store).unwrap());
         
         RaftNode {
+            conf,
             id,
             current_term: 0,
             leader_id: None,
@@ -193,20 +206,39 @@ impl RaftNode {
         };
     }
 
+    pub fn spin_up_threads(node: Arc<Mutex<Self>>) {
+        
+
+        // Similarly for any other threads/tasks...
+    }
     async fn listen_for_requests(&mut self) {
-        while let Some((request, response_sender)) = self.rpc_recv_channel.recv().await {
-            match request {
-                RaftTransportRequest::AppendEntries(args) => {
-                    let response = self.append_entries(args);
-                    let _ = response_sender.send(RaftTransportResponse::AppendEntries(response)).await;
-                },
-                RaftTransportRequest::RequestVote(args) => {
-                    let response = self.request_vote(args);
-                    let _ = response_sender.send(RaftTransportResponse::RequestVote(response)).await;
-                },
+        loop {
+            match self.rpc_recv_channel.recv().await {
+                Some((request, response_sender)) => {
+                    let result = match request {
+                        RaftTransportRequest::AppendEntries(args) => {
+                            let response = self.append_entries(args);
+                            response_sender.send(RaftTransportResponse::AppendEntries(response)).await
+                        },
+                        RaftTransportRequest::RequestVote(args) => {
+                            let response = self.request_vote(args);
+                            response_sender.send(RaftTransportResponse::RequestVote(response)).await
+                        },
+                    };
+    
+                    if let Err(e) = result {
+                        error!("Error handling request: {}", e);
+                    }
+                }
+                None => {
+                    error!("Channel was closed, restarting listener");
+                    continue;
+                }
             }
         }
     }
+    
+    
 
     fn spin_up_process(&mut self, state: NodeState) {}
     fn run_follower_forever(&mut self) {
