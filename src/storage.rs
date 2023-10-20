@@ -20,11 +20,12 @@ impl LogStorage {
         if capacity == 0 {
             return Err(RaftError::InvalidStorageCapacity);
         }
-
+        
         Ok(LogStorage {
             store,
             cache: Mutex::new(vec![None; capacity]),
         })
+
     }
 }
 
@@ -47,7 +48,11 @@ impl LogStore for LogStorage {
 
     fn store_logs(&mut self, logs: &[LogEntry]) -> Result<(), StoreError> {
         self.store.store_logs(logs)?;
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner()
+        };
+
         for log in logs {
             let cached_idx = (log.index % cache.len() as u64) as usize;
             cache[cached_idx] = Some(Arc::new(log.clone()));
@@ -64,7 +69,11 @@ impl LogStore for LogStorage {
     }
 
     fn delete_range(&mut self, min_idx: u64, max_idx: u64) {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner()
+        };
+        
         for idx in min_idx..=max_idx {
             let cached_idx = (idx % cache.len() as u64) as usize;
             cache[cached_idx] = None;
