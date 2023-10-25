@@ -126,7 +126,7 @@ impl ConfigBuilder {
             return Err(ConfigError::InvalidElectionTimeout);
         }
         
-        if heartbeat_interval > election_timeout {
+        if heartbeat_interval > DEFAULT_ELECTION_TIMEOUT_MAX {
             return Err(ConfigError::InvalidHeartbeatInterval);
         }
         

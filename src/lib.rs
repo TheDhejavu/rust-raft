@@ -9,20 +9,23 @@ use futures::stream::StreamExt;
 use ::log::*;
 use rand::Rng;
 use node::{Node, ReplicaNode};
-use storage::{LogStore, LogStorage};
+use stable::StableStore;
+use state::RaftStateKey;
+use storage::LogStore;
+use tokio::sync::RwLock;
 use crate::state::{NodeState, RaftState};
 use std::collections::HashMap;
 use crate::raft::{
     AppendEntriesRequest, AppendEntriesResponse,
     RequestVoteRequest, RequestVoteResponse,
 };
-
+use std::collections::VecDeque;
 use crate::grpc_transport::{RaftTransportResponse,RaftTransportRequest};
 
 mod configuration;
-mod storage;
+pub mod storage;
 mod state;
-mod error;
+pub mod error;
 mod utils;
 mod mocks;
 pub mod datastore;
@@ -31,11 +34,15 @@ pub mod log;
 pub mod fsm;
 pub mod grpc_transport;
 pub mod node;
+pub mod stable;
 
 mod raft {
     tonic::include_proto!("raft"); 
 }
 
+pub enum RaftNodeServerMessage {
+   Apply(Vec<u8>)
+}
 
 /// `RaftNodeServer` represents a node in a Raft cluster. 
 ///
@@ -66,18 +73,38 @@ pub struct RaftNodeServer {
     fsm: Box<dyn FSM>,
 
     /// Log entries storage mechanism.
-    logs: Box<dyn LogStore>,
+    logs: Arc<RwLock<Box<dyn LogStore>>>,
 
     /// Channels to signal stopping server background task.
-    stop_channel: (tokio::sync::mpsc::Sender<()>, tokio::sync::mpsc::Receiver<()>),
+    shutdown_tx_rx: (tokio::sync::mpsc::Sender<()>, tokio::sync::mpsc::Receiver<()>),
 
     /// A flag indicating whether a heartbeat has been received.
     received_heartbeat: Arc<AtomicBool>,
 
-    /// Channel to receive incoming Raft RPCs.
-    rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
-}
+    // A stable storage for persisting raft state
+    stable: Box<dyn StableStore>,
 
+    /// Channel to receive incoming Raft RPCs.
+    rpc_rx: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
+
+    // Leader specific channel for processing commit index
+    process_commit_tx: tokio::sync::mpsc::Sender<u64>, 
+    process_commit_rx: tokio::sync::mpsc::Receiver<u64>,
+
+    // Leader specific channel for advancing commit index 
+    advance_commit_tx: tokio::sync::mpsc::Sender<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+    advance_commit_rx: tokio::sync::mpsc::Receiver<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+
+    fsm_apply_tx: tokio::sync::mpsc::Sender<log::LogEntry>,
+    fsm_apply_rx: tokio::sync::mpsc::Receiver<log::LogEntry>,
+ 
+    // Leader specific queue for applying log entry based on FIFO
+    inflight_entry_queue: VecDeque<log::LogEntry>,
+
+    /// Channel interacting with the Raft Node server, this is a temporary solution. 
+    /// There should be a way to run the Raft Node server in a way that's shareable for multiple threads to call.
+    api_message_rx: tokio::sync::mpsc::UnboundedReceiver<(RaftNodeServerMessage, tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+}
 
 impl RaftNodeServer {
     pub async fn new(
@@ -85,39 +112,79 @@ impl RaftNodeServer {
         conf: Config,
         nodes: Vec<Node>,
         fsm: Box<dyn FSM>,
-        log_store: Box<dyn LogStore>,
-        rpc_recv_channel: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
+        stable: Box<dyn StableStore>,
+        logs: Box<dyn LogStore>,
+        rpc_rx: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
+        api_message_rx: tokio::sync::mpsc::UnboundedReceiver<(RaftNodeServerMessage, tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
     ) -> Self {
-        let logs = Box::new(LogStorage::new(256, log_store).unwrap());
-        let stop_channel = tokio::sync::mpsc::channel::<()>(1);
-
+        let shutdown_tx_rx = tokio::sync::mpsc::channel::<()>(1);
+        let (advance_commit_tx, advance_commit_rx, ) = tokio::sync::mpsc::channel::<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>(1);
+        let ( process_commit_tx,  process_commit_rx, ) = tokio::sync::mpsc::channel::<u64>(1);
+        let ( fsm_apply_tx,  fsm_apply_rx, ) = tokio::sync::mpsc::channel::<log::LogEntry>(1);
+       
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
             .filter_module("sled", ::log::LevelFilter::Warn) 
             .init();
-        
+
+        let raft_state =  Arc::new(RaftState {
+            votes: Mutex::new(0),
+            voted_for: Mutex::new(None),
+            current_term: Mutex::new(0),
+            commit_index: Mutex::new(0),
+            last_applied: Mutex::new(0),
+        });
+
+        let commit_index  = stable.get(RaftStateKey::COMMIT_INDEX);
+        if let Ok(Some(idx)) = commit_index  {
+            raft_state.set_commit_index(idx);
+        }
+
+        let current_term  = stable.get(RaftStateKey::CURRENT_TERM);
+        if let Ok(Some(term)) = current_term  {
+            raft_state.set_current_term(term);
+        }
+
+        let voted_for  = stable.get_str(RaftStateKey::VOTED_FOR);
+        if let Ok(node_id) = voted_for  {
+            raft_state.set_voted_for(node_id);
+        }
+
         Self {
             state: Arc::new(Mutex::new(NodeState::Follower)),
             conf,
             id: Arc::new(id),
+            inflight_entry_queue: VecDeque::new(),
+            advance_commit_tx,
+            advance_commit_rx,
+            fsm_apply_tx,
+            fsm_apply_rx,
+            process_commit_rx,
+            process_commit_tx,
             leader_id: None,
-            stop_channel,
+            shutdown_tx_rx,
+            api_message_rx,
             nodes: Arc::new(nodes),
             replica_nodes: None,
             received_heartbeat: Arc::new(AtomicBool::new(false)),
             fsm,
-            logs,
-            rpc_recv_channel,
-            raft_state: Arc::new(RaftState {
-                votes: Mutex::new(0),
-                voted_for: Mutex::new(None),
-                current_term: Mutex::new(0),
-                commit_index: Mutex::new(0),
-                last_applied: Mutex::new(0),
-            }),
+            logs: Arc::new(RwLock::new(logs)),
+            stable,
+            rpc_rx,
+            raft_state,
         }
     }
 
+
+    /// Return true if current node is the leader
+    pub fn is_leader(&self) -> bool {
+        self.leader_id.is_some() && self.leader_id.clone().unwrap() == self.id
+    }
+
+    /// Return true if current node is the leader
+    pub fn server_id(&self) -> Arc<String> {
+        self.id.clone()
+    }
 
     /// Retrieves the current term of the node.
     fn get_current_term(&self) -> u64 {
@@ -126,6 +193,9 @@ impl RaftNodeServer {
 
     /// Sets the current term of the node to the specified value.
     fn set_current_term(&self, value: u64) {
+        if let Err(e) = self.stable.set(RaftStateKey::CURRENT_TERM, value){
+            error!("unable to persist current term to disk: {:?}", e)
+        };
         self.raft_state.set_current_term(value);
     }
 
@@ -136,6 +206,9 @@ impl RaftNodeServer {
 
     /// Sets the commit index to the given value.
     fn set_commit_index(&self, value: u64) {
+        if let Err(e) = self.stable.set(RaftStateKey::COMMIT_INDEX, value){
+            error!("unable to persist commit index to disk: {:?}", e)
+        };
         self.raft_state.set_commit_index(value);
     }
 
@@ -166,23 +239,26 @@ impl RaftNodeServer {
 
     /// Sets the identifier of the node that this node votes for.
     fn set_voted_for(&self, node_id: Option<String>) {
+        if let Err(e) = self.stable.set_str(RaftStateKey::VOTED_FOR, node_id.clone().unwrap_or("".to_string())){
+            error!("unable to persist voted_for to disk: {:?}", e)
+        };
         self.raft_state.set_voted_for(node_id);
     }
 
     /// Retrieves the term of the last log entry.
-    fn get_last_log_term(&self) -> u64 {
-        match self.logs.get_log(self.logs.last_index()) {
-            Some(log) => log.term,
-            None => 0,
+    async fn get_last_log_term(&self) -> u64 {
+        match self.logs.read().await.get_log(self.logs.read().await.last_index()) {
+            Ok(Some(log)) => log.term,
+            Ok(None) => 0,
+            Err(_) => 0,
         }
     }
 
     /// Retrieves the index of the last log entry.
-    fn get_last_log_index(&self) -> u64  {
-        self.logs.last_index()
+    async fn get_last_log_index(&self) -> u64  {
+        self.logs.read().await.last_index()
     }
     
- 
     /// Transitions the node's state to `Leader`.
     ///
     /// When a node becomes a leader, this function will update 
@@ -224,7 +300,7 @@ impl RaftNodeServer {
     /// 4. Append any new entries not already in the log.
     /// 5. If `leaderCommit` is greater than `commitIndex`, set `commitIndex` 
     ///    to the minimum of `leaderCommit` and the index of the last new entry.
-    fn append_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
+    async fn append_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
         info!("recv.append_entries request.");
         // Check if term is outdated
         if args.term < self.get_current_term() {
@@ -232,17 +308,16 @@ impl RaftNodeServer {
                 term: self.get_current_term(),
                 success: false,
             };
-        } 
+        }
 
-
-        let prev_log_entry = self.logs.get_log(args.prev_log_index);
+        let prev_log_entry = self.logs.read().await.get_log(args.prev_log_index);
         let mut prev_log_term: u64 = 0;
-        if let Some(log_entry) = prev_log_entry {
+        if let Ok(Some(log_entry)) = prev_log_entry {
             prev_log_term = log_entry.term;
         }
 
         // Check if log is consistent with new entries
-        if args.prev_log_index > self.logs.last_index() as  u64 || prev_log_term != args.prev_log_term
+        if args.prev_log_index > self.logs.read().await.last_index() as  u64 || prev_log_term != args.prev_log_term
         {
             return AppendEntriesResponse {
                 term: self.get_current_term(),
@@ -251,15 +326,14 @@ impl RaftNodeServer {
         }
 
         // Remove any conflicting entries and append new entries
-        self.logs.delete_range(args.prev_log_index, args.prev_log_index + 1);
+        self.logs.write().await.delete_range(args.prev_log_index, args.prev_log_index + 1);
 
         if args.commit_index > self.get_commit_index() {
-            self.set_commit_index(args.commit_index.min(self.get_last_log_index() as  u64 - 1));
+            self.set_commit_index(args.commit_index.min(self.get_last_log_index().await as  u64 - 1));
         }
 
         // Update term and leader id
         self.set_current_term(args.term);
-
         if args.entries.len() > 0 {
             
         }
@@ -276,7 +350,7 @@ impl RaftNodeServer {
     /// - Reply false if `term` is less than `currentTerm`.
     /// - If `votedFor` is null or `candidateId`, and the candidate’s log 
     ///   is at least as up-to-date as the receiver’s log, grant the vote.
-    fn request_vote(&mut self, args: RequestVoteRequest) -> RequestVoteResponse {
+    async fn request_vote(&mut self, args: RequestVoteRequest) -> RequestVoteResponse {
         // Check if term is outdated
         if args.term < self.get_current_term() {
             return RequestVoteResponse {
@@ -292,9 +366,9 @@ impl RaftNodeServer {
         }
 
         // Check if candidate's log is at least as up-to-date as receiver's log
-        let last_entry = self.logs.get_log(self.logs.last_index());
-        if let Some(entry) = last_entry {
-            if args.last_log_term < entry.term || (args.last_log_term == entry.term && args.last_log_index < self.logs.last_index() as  u64) {
+        let last_entry = self.logs.read().await.get_log(self.logs.read().await.last_index());
+        if let Ok(Some(entry)) = last_entry {
+            if args.last_log_term < entry.term || (args.last_log_term == entry.term && args.last_log_index < self.logs.read().await.last_index() as  u64) {
                 return RequestVoteResponse {
                     term: self.get_current_term(),
                     vote_granted: false,
@@ -370,11 +444,6 @@ impl RaftNodeServer {
 
         self.run().await;
     }
-    
-    fn is_running(&mut self) -> bool {    
-        let state = self.get_state().unwrap();
-        return !(state == Some(NodeState::Stopped));
-    }
 
     async fn run_follower_loop(&mut self) {
         info!("server.follower.loop");
@@ -391,21 +460,43 @@ impl RaftNodeServer {
                     info!("Running as {:?}...", current_state.clone().unwrap()); 
     
                     tokio::select! {
-                        _ = tokio::time::sleep(election_timeout) => {
-                            info!("Election timed-out. do stuff");
-                            self.become_candidate();
+                        msg = self.api_message_rx.recv() => { 
+                            match msg {
+                                Some((request, response_sender))  => {
+                                    let result = match request {
+                                        RaftNodeServerMessage::Apply(_) => {
+                                            response_sender.send(Err(RaftError::NotLeader)).await
+                                        }
+                                    };
+                                    if let Err(e) = result {
+                                        error!("error handling request: {}", e);
+                                    }
+                                },
+                                None => {},
+                            }
                         },
-                        rpc_result = self.rpc_recv_channel.recv() => match rpc_result {
+                        result = self.advance_commit_rx.recv() => { 
+                            match result {
+                                Some((_, response_sender))  => {
+                                    _ = response_sender.send(Err(RaftError::NotLeader)).await;
+                                },
+                                None => {},
+                            }
+                        },
+                        idx = self.process_commit_rx.recv() => { 
+                            // response_sender.send(Err(RaftError::NotLeader)).await
+                        },
+                        rpc_result = self.rpc_rx.recv() => match rpc_result {
                             Some((request, response_sender)) => {
                                 let result = match request {
                                     RaftTransportRequest::AppendEntries(args) => {
                                         self.set_receive_heartbeat();
-                                        let response = self.append_entries(args);
+                                        let response = self.append_entries(args).await;
                                         response_sender.send(RaftTransportResponse::AppendEntries(response)).await
                                     },
                                     RaftTransportRequest::RequestVote(args) => {
                                         self.set_receive_heartbeat();
-                                        let response = self.request_vote(args);
+                                        let response = self.request_vote(args).await;
                                         response_sender.send(RaftTransportResponse::RequestVote(response)).await
                                     },
                                 };
@@ -418,7 +509,11 @@ impl RaftNodeServer {
                                 error!("channel was closed, restarting listener");
                             }
                         },
-                        _ = self.stop_channel.1.recv() => { 
+                        _ = tokio::time::sleep(election_timeout) => {
+                            info!("Election timed-out. do stuff");
+                            self.become_candidate();
+                        },
+                        _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the follower loop");
                             self.set_state(NodeState::Stopped);
                             return;
@@ -460,8 +555,8 @@ impl RaftNodeServer {
                             let req = RequestVoteRequest { 
                                 term: new_term, 
                                 candidate_id: self.id.clone().to_string(), 
-                                last_log_index: self.get_last_log_index(), 
-                                last_log_term: self.get_last_log_term(),
+                                last_log_index: self.get_last_log_index().await, 
+                                last_log_term: self.get_last_log_term().await,
                                 commit_index: self.get_commit_index(), 
                             };
     
@@ -501,28 +596,39 @@ impl RaftNodeServer {
                     }
     
                     tokio::select! {
-                        _ = self.stop_channel.1.recv() => { 
-                            info!("Stopping the candidate loop");
-                            self.set_state(NodeState::Stopped);
-                            return;
+                        msg = self.api_message_rx.recv() => { 
+                            match msg {
+                                Some((request, response_sender))  => {
+                                    _ = match request {
+                                        RaftNodeServerMessage::Apply(_) => {
+                                            response_sender.send(Err(RaftError::NotLeader)).await
+                                        }
+                                    };
+                                },
+                                None => {},
+                            }
                         },
-                        rpc_result = self.rpc_recv_channel.recv() => match rpc_result {
+                        result = self.advance_commit_rx.recv() => { 
+                            match result {
+                                Some((_, response_sender))  => {
+                                    _ = response_sender.send(Err(RaftError::NotLeader)).await;
+                                },
+                                None => {},
+                            }
+                        },
+                        rpc_result = self.rpc_rx.recv() => match rpc_result {
                             Some((request, response_sender)) => {
-                                let result = match request {
+                                _ = match request {
                                     RaftTransportRequest::AppendEntries(args) => {
                                         self.set_receive_heartbeat();
-                                        let response = self.append_entries(args);
+                                        let response = self.append_entries(args).await;
                                         response_sender.send(RaftTransportResponse::AppendEntries(response)).await
                                     },
                                     RaftTransportRequest::RequestVote(args) => {
-                                        let response = self.request_vote(args);
+                                        let response = self.request_vote(args).await;
                                         response_sender.send(RaftTransportResponse::RequestVote(response)).await
                                     },
                                 };
-                    
-                                if let Err(e) = result {
-                                    error!("error handling request: {}", e);
-                                }
                             },
                             None => {
                                 error!("channel was closed, restarting listener");
@@ -530,6 +636,11 @@ impl RaftNodeServer {
                         },
                         _ = tokio::time::sleep(election_timeout) => {
                             info!("Election timeout reached, restarting election...");
+                            return;
+                        },
+                        _ = self.shutdown_tx_rx.1.recv() => { 
+                            info!("Stopping the candidate loop");
+                            self.set_state(NodeState::Stopped);
                             return;
                         },
                     }
@@ -554,8 +665,53 @@ impl RaftNodeServer {
                     if current_state != Some(NodeState::Leader) {
                         break
                     }
+                    // info!("Running as {:?}...", current_state.clone().unwrap());
+                    tokio::select! {
+                        cmd = self.api_message_rx.recv() => { 
+                            match cmd {
+                                Some((request, response_sender))  => {
+                                    let result = match request {
+                                        RaftNodeServerMessage::Apply(data) => {
+                                            info!("Handle log entry ===/ ");
+                                            _ = self.handle_log_entry(data).await;
+                                            response_sender.send(Ok(())).await
+                                        }
+                                    };
 
-                    // info!("Running as {:?}...", current_state.clone().unwrap()); 
+                                    if let Err(e) = result {
+                                        error!("error handling request: {}", e);
+                                    }
+                                },
+                                None => {},
+                            }
+                        },
+                        result = self.advance_commit_rx.recv() => { 
+                            match result {
+                                Some((_, response_sender))  => {
+                                    // Advance leader commit Index by calculating the matching indexes of the replica nodes
+                                    let current_commit_index = self.raft_state.get_commit_index();
+                                    if let Some(majority_index) = self.majority_replicated_index().await {
+                                        if majority_index > current_commit_index {
+                                            self.set_commit_index(majority_index);
+                                            _ = self.process_commit_tx.send(majority_index).await;
+                                        }
+                                    }
+                                    _ = response_sender.send(Ok(())).await;
+                                },
+                                None => {},
+                            }
+                        },
+                        idx = self.process_commit_rx.recv() => { 
+                            let commit_index = self.get_commit_index();
+                            
+                        },
+                        _ = self.shutdown_tx_rx.1.recv() => { 
+                            info!("Stopping the leader loop");
+                            self.set_state(NodeState::Stopped);
+                            return;
+                        },
+                        
+                    }
                 },
                 Err(e) =>  {
                     error!("unable to unlock node state: {}", e);
@@ -594,8 +750,7 @@ impl RaftNodeServer {
     /// successfully initialized nodes`.
     async fn start_replica_nodes(&mut self) {
         let current_term = self.get_current_term();
-        let next_index = self.get_last_log_index() + 1;
-        let commit_index = self.get_commit_index();
+        let next_index = self.get_last_log_index().await + 1;
         let heartbeat_interval = self.conf.heartbeat_interval;
 
         let nodes = &*self.nodes;
@@ -605,7 +760,6 @@ impl RaftNodeServer {
                 let result = ReplicaNode::new(
                     node.clone(),
                     current_term,
-                    commit_index,
                     next_index,
                     heartbeat_interval,
                 ).await;
@@ -623,16 +777,31 @@ impl RaftNodeServer {
         let replica_map: HashMap<String, Arc<tokio::sync::Mutex<ReplicaNode>>> = results.into_iter().filter_map(|x| x).collect();
         self.replica_nodes = Some(replica_map);
 
-        if let Some(replica_map) = &self.replica_nodes {
-            for (_, replica_mutex) in replica_map.iter() {
-                let replica_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_mutex.clone();
-                let leader_id = self.id.clone();
-                let raft_state = self.raft_state.clone();
-                
-                // Spawning heartbeat task
-                tokio::task::spawn(async move {
-                    ReplicaNode::run_periodic_heartbeat(leader_id, raft_state, replica_clone).await;
-                });
+        if let Some(replica_node_map) = &self.replica_nodes {
+            for (_, replica_node) in replica_node_map.iter() {
+               let (stop_heartbeat_rx, stop_heartbeat_tx) = tokio::sync::mpsc::channel::<()>(1);
+               {
+                    let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
+                    let leader_id = self.id.clone();
+                    let raft_state = self.raft_state.clone();
+                    
+                    // spawning Replica heartbeat task
+                    tokio::task::spawn(async move {
+                        ReplicaNode::run_periodic_heartbeat(stop_heartbeat_tx, leader_id, raft_state, replica_node_clone).await;
+                    });
+               }
+
+               {
+                    let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
+                    let raft_state = self.raft_state.clone();
+                    let logs = self.logs.clone();
+                    let advance_commit_tx = self.advance_commit_tx.clone();
+                    
+                    // spawning Replica task handler
+                    tokio::task::spawn(async move {
+                        ReplicaNode::run(logs,stop_heartbeat_rx,  advance_commit_tx, raft_state, replica_node_clone).await;
+                    });
+               }
             }
         }
     }
@@ -643,5 +812,65 @@ impl RaftNodeServer {
         }
     }
 
+    async fn notify_all_replica_of_new_entry(&mut self)  {
+        for (_, node) in self.replica_nodes.as_mut().unwrap() {
+            if let Err(e) = node.lock().await.entry_replica_tx.send(()).await {
+                error!("unable to notify replica of new log entry: {}", e);
+            }
+        }
+    }
 
+    async fn handle_log_entry(&mut self, data: Vec<u8>)-> Result<(), RaftError>{
+        let new_log = log::LogEntry{
+            log_entry_type: log::LogEntryType::LogCommand,
+            index: self.get_last_log_index().await + 1,
+            data,
+            term: self.get_current_term(),
+        };
+        info!("New log entry {:?}", new_log);
+
+        // track log inflight for processing when committed (only applicable to the leader).
+        self.inflight_entry_queue.push_back(new_log.clone());
+
+        let store_log_result = {
+            let mut log_writer = self.logs.write().await;
+            log_writer.store_log(&new_log)
+        };
+        
+        if let Err(e) = store_log_result {
+            error!("unable to store log {:?}", e);
+            self.become_follower();
+            return Err(RaftError::LogFailed);
+        }
+
+        self.notify_all_replica_of_new_entry().await;
+        
+        Ok(())
+    }
+
+    /// Calculate the highest index that has been replicated on a majority of them.
+    async fn majority_replicated_index(&self) -> Option<u64> {
+        if let Some(replicas) = self.replica_nodes.as_ref() {
+            // Obtain match indexes from all replicas
+            let mut match_indexes: Vec<u64> = futures::future::join_all(replicas.values().map(|replica| {
+                async {
+                    let locked_replica = replica.lock().await;
+                    locked_replica.match_index
+                }
+            })).await;
+            
+            // Sort the match indexes
+            match_indexes.sort_unstable();
+            
+            // Find the middle index which represents the majority in a sorted list
+            let middle = replicas.len() / 2; 
+            
+            return match_indexes.get(middle).cloned();
+        }
+        None
+    }
+
+    async fn process_committed_logs(&mut self) {
+
+    }
 }

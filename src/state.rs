@@ -13,6 +13,13 @@ pub enum NodeState {
     Stopped,
 }
 
+pub struct RaftStateKey;
+
+impl RaftStateKey {
+    pub const COMMIT_INDEX: &str = "commit_index";
+    pub const VOTED_FOR: &str = "voted_for";
+    pub const CURRENT_TERM: &str = "current_term";
+}
 
 /// Represents the state associated with a node in a Raft cluster.
 pub struct RaftState {
@@ -31,7 +38,6 @@ pub struct RaftState {
     /// The highest log entry applied to the state machine.
     pub last_applied: Mutex<u64>,
 }
-
 
 impl RaftState {
     /// Retrieves the current term of the node.
