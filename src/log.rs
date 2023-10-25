@@ -1,3 +1,5 @@
+use crate::raft;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogEntryType {
     LogCommand,
@@ -58,6 +60,35 @@ impl LogEntry {
         let data = bytes[21..21 + data_len as usize].to_vec();
 
         Some(LogEntry { index, term, log_entry_type, data })
+    }
+
+    pub fn from_rpc_raft_log(entry: raft::LogEntry) -> Option<LogEntry> {
+        let log_entry_type = match entry.log_entry_type {
+            x if x == raft::LogEntryType::LogCommand as i32 => Some(LogEntryType::LogCommand),
+            x if x == raft::LogEntryType::ConfCommand as i32 => Some(LogEntryType::ConfCommand),
+            _ => None,  
+        };
+
+        log_entry_type.map(|log_type| {
+            LogEntry {
+                index: entry.index,
+                term: entry.term,
+                log_entry_type: log_type,
+                data: entry.data,
+            }
+        })
+    }
+
+    pub fn to_rpc_raft_log(self)  -> raft::LogEntry {
+        raft::LogEntry  {
+            index: self.index,
+            term: self.term,
+            log_entry_type: match self.log_entry_type {
+                LogEntryType::LogCommand => 0,  
+                LogEntryType::ConfCommand => 1,
+            },
+            data: self.data.clone(),
+        }
     }
 }
 

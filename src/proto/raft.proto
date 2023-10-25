@@ -2,8 +2,8 @@ syntax = "proto3";
 package raft;
 
 enum LogEntryType {
-    CommandLog = 0;
-    ConfigurationLog = 1;
+    LogCommand = 0;
+    ConfCommand = 1;
 }
 
 message LogEntry {

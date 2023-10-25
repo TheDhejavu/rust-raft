@@ -117,7 +117,7 @@ impl ReplicaNode {
         let response = self.grpc_transport.append_entries(heartbeat_message).await;
         match response {
             Ok(_) => {
-                info!("Heartbeat sent successfully to: {}", self.node.id);
+                // info!("Heartbeat sent successfully to: {}", self.node.id);
                 Ok(())
             },
             Err(err) => {
@@ -132,11 +132,12 @@ impl ReplicaNode {
         leader_id:  String, 
         prev_index: u64, 
         prev_term: u64, 
+        term: u64,
         commit_index: u64,
         entries: Vec<LogEntry>,
     ) -> Result<AppendEntriesResponse, RaftError> {
         let heartbeat_message = AppendEntriesRequest {
-            term: self.current_term,
+            term: term,
             leader_id,
             prev_log_index: prev_index,
             prev_log_term: prev_term,
@@ -197,7 +198,7 @@ impl ReplicaNode {
                     let node_address = replica.node.address.clone();
                     let commit_index = raft_state.get_commit_index();
 
-                    info!("node.heartbeat.send <> {}", node_address);
+                    // info!("node.heartbeat.send <> {}", node_address);
                     _ = replica.send_heartbeat(leader_id.to_string(), commit_index).await;
                 }
             };
@@ -220,6 +221,7 @@ impl ReplicaNode {
             entry_receiver = replica.entry_replica_rx.clone();
             node_address = replica.node.address.clone();
         }
+        let current_term = raft_state.get_current_term();
         info!("node.replica.run <> {}", node_address); 
     
         loop {
@@ -232,9 +234,8 @@ impl ReplicaNode {
                     break;
                 },
                 _ = locked_entry.recv() => {
-                    let last_index = logs.read().await.last_index();
-                    let last_term = logs.read().await.get_log(last_index).map_or(0, |opt_log| opt_log.map_or(0, |log| log.term));
-
+                    info!("Start Replication ==== / ");
+                    let last_log_index = logs.read().await.last_index();
                     // get initial values outside of the loop
                     let mut next_index;
                     let leader_id;
@@ -243,55 +244,63 @@ impl ReplicaNode {
                         next_index = replica.next_index;
                         leader_id = replica.node.id.clone();
                     }
-    
-                    let mut retries = 20;
+                    
+                    let mut retries = 10;
                     let mut backoff_duration = Duration::from_millis(100); 
-    
+                    
                     // replicate starting from the next_index to the current last_index
-                    while next_index <= last_index && retries > 0 {
-                        let entries = logs.read().await.get_logs_from_range(next_index, last_index).unwrap();
+                    while next_index <= last_log_index && retries > 0 {
+                        if next_index <= 0 {
+                            break
+                        }
+
+                        let last_index = next_index - 1;
+                        let last_term = logs.read().await.get_log(last_index).map_or(0, |opt_log| opt_log.map_or(0, |log| log.term));
+                        info!("next_index: {} last_index: {} retries: {}  leader_id: {} last_term: {}", next_index, last_index ,retries, leader_id, last_term);
+
+                        let entries = logs.read().await.get_logs_from_range(next_index, last_log_index).unwrap();
+                        info!("read entries done ==/ ");
+
                         let entries_to_replicate: Vec<LogEntry> = entries.into_iter()
-                            .map(|entry| {
-                                LogEntry {
-                                    index: entry.index,
-                                    term: entry.term,
-                                    log_entry_type: match entry.log_entry_type {
-                                        LogEntryType::LogCommand => 0,  
-                                        LogEntryType::ConfCommand => 1,
-                                    },
-                                    data: entry.data.clone(),
-                                }
-                            })
+                            .map(|entry| entry.to_rpc_raft_log())
                             .collect();
     
                         let commit_index = raft_state.get_commit_index();
                         let result = {
                             let mut replica = replica_node.lock().await;
-                            replica.send_append_entries(leader_id.clone(), commit_index, last_index, last_term, entries_to_replicate.clone()).await
+                            replica.send_append_entries(leader_id.clone(), last_index, last_term, current_term, commit_index, entries_to_replicate.clone()).await
                         };
+                        info!("replica.send_append_entries.done ==/ ");
                 
                         match result {
                             Ok(response) => {
                                 if response.success {
                                     info!("Success: update match and next index");
-                                    let mut replica = replica_node.lock().await;
-                                    replica.update_match_index(next_index);
+                                    {
+                                        let mut replica = replica_node.lock().await;
+                                        replica.update_match_index(next_index);
 
-                                    next_index += 1;
-                                    replica.update_next_index(next_index);
+                                        next_index += 1;
+                                        replica.update_next_index(next_index);
+                                    }
 
+                                    info!("start advance commit index ==/ ");
                                     let (tx, mut rx ) = tokio::sync::mpsc::channel::<Result<(), RaftError>>(1);
                                     match advance_commit_tx.send(((), tx)).await {
                                         Ok(_) => {
+                                            info!("response.wait ==/ ");
                                             let result = rx.recv().await;
                                             if let Some(Err(e) )= result {
                                                 error!("unable to advance commit: {}", e);
                                             }
+                                            info!("response.wait.after ==/ ");
                                         },
                                         Err(e) => error!("unable to advance commit: {}", e),
                                     }
+                                   
                                 } else {
                                     if next_index > 0 {
+                                        
                                         next_index -= 1;
                                     }
                                     backoff_duration = Duration::from_millis(backoff_duration.as_millis() as u64 * 2);
@@ -307,6 +316,7 @@ impl ReplicaNode {
                         tokio::time::sleep(backoff_duration).await;
                         retries -= 1;
                     }
+                    info!(" == Completed Replication ==== / ");
                 },
                 
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}

@@ -91,7 +91,7 @@ async fn main() {
 
             let grpc_server: RaftGrpcTransportServer = RaftGrpcTransportServer::new(rpc_tx);
 
-            let cfg = Config::build().server_id(server_id.to_string()).heartbeat_interval(130).validate().unwrap();
+            let cfg = Config::build().server_id(server_id.to_string()).validate().unwrap();
 
             let mut nodes: Vec<Node> = vec![];
 
@@ -133,8 +133,10 @@ async fn main() {
             _ = tokio::join!(
                 raft_node.start(),
                 grpc_server.run(server_addr),
-                api_server,
+                api_server
             );
+
+        
         },
         _ => {
             eprintln!("Invalid command. Use --help for more info.");
@@ -211,7 +213,9 @@ async fn store_handler(
     req_body: web::Json<RequestBody>,
 ) -> Result<HttpResponse, Error> {
     let raft_message_tx = &data.message_tx;
-    match bincode::serialize(&*req_body) {
+
+    let command = StateMachineCommand::Add { key: req_body.key.to_string(), value: req_body.value.to_string() };
+    match bincode::serialize(&command) {
         Ok(data) => {
             let (tx, mut rx) =  mpsc::channel::<Result<(), RaftError>>(1);
             match raft_message_tx.send((RaftNodeServerMessage::Apply(data), tx)) {

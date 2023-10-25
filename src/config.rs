@@ -18,6 +18,8 @@ pub const DEFAULT_MAX_PAYLOAD_ENTRIES: u64 = 30;
 // The default maximum number of log entries that the Raft node can store.
 pub const DEFAULT_MAX_LOG_ENTRIES: u64 = 100;
 
+pub const DEFAULT_MAX_APPEND_ENTRIES: usize = 100;
+
 // Represents the configuration for a Raft node.
 pub struct Config {
     pub server_id: String,
@@ -31,6 +33,8 @@ pub struct Config {
     pub heartbeat_interval: u64,
     // The maximum number of log entries the node should store.
     pub max_log_entries: u64,
+    // The maximum number of log entries that should be appended at a time.
+    pub max_append_entries: usize,
     // The maximum number of entries a node will include in a single replication payload.
     pub max_payload_size: u64,
 }
@@ -44,6 +48,7 @@ impl Config {
             election_timeout: None,
             heartbeat_interval: None,
             max_log_entries: None,
+            max_append_entries: None,
             max_payload_size: None,
         }
     }
@@ -56,6 +61,7 @@ pub struct ConfigBuilder {
     heartbeat_interval: Option<u64>,
     max_log_entries: Option<u64>,
     max_payload_size: Option<u64>,
+    max_append_entries: Option<usize>,
     election_timeout_min: Option<u64>,
     election_timeout_max: Option<u64>,
 }
@@ -74,6 +80,11 @@ impl ConfigBuilder {
     // Sets the election timeout minimum for the config.
     pub fn election_timeout_min(mut self, value: u64) -> Self {
         self.election_timeout_min = Some(value);
+        self
+    }
+    // Sets the max append entries for the config.
+    pub fn max_append_entries(mut self, value: usize) -> Self {
+        self.max_append_entries = Some(value);
         self
     }
     // Sets the election timeout maximum for the config.
@@ -112,6 +123,7 @@ impl ConfigBuilder {
         let heartbeat_interval = self.heartbeat_interval.unwrap_or(DEFAULT_HEARTBEAT_INTERVAL);
         let max_log_entries = self.max_log_entries.unwrap_or(DEFAULT_MAX_LOG_ENTRIES);
         let max_payload_size = self.max_payload_size.unwrap_or(DEFAULT_MAX_PAYLOAD_ENTRIES);
+        let max_append_entries = self.max_append_entries.unwrap_or(DEFAULT_MAX_APPEND_ENTRIES);
 
 
         if election_timeout < DEFAULT_ELECTION_TIMEOUT_MIN || election_timeout > DEFAULT_ELECTION_TIMEOUT_MAX {
@@ -140,6 +152,7 @@ impl ConfigBuilder {
 
         let config = Config {
             server_id,
+            max_append_entries,
             election_timeout,
             heartbeat_interval,
             max_log_entries,

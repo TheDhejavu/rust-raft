@@ -179,19 +179,19 @@ mod tests {
                 LogEntry { 
                     index: 1, 
                     term: 1, 
-                    log_entry_type: LogEntryType::CommandLog as i32, 
+                    log_entry_type: LogEntryType::LogCommand as i32, 
                     data: "config_change_cmd".as_bytes().to_vec() 
                 },
                 LogEntry { 
                     index: 2, 
                     term: 1, 
-                    log_entry_type: LogEntryType::ConfigurationLog as i32, 
+                    log_entry_type: LogEntryType::ConfCommand as i32, 
                     data: "log_cmd".as_bytes().to_vec() 
                 },
                 LogEntry { 
                     index: 3, 
                     term: 2, 
-                    log_entry_type: LogEntryType::CommandLog as i32, 
+                    log_entry_type: LogEntryType::LogCommand as i32, 
                     data: "log_cmd".as_bytes().to_vec() 
                 },
             ],

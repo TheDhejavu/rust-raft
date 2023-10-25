@@ -1,4 +1,6 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+
+use crate::{error, stable::StableStore};
 impl Default for NodeState {
     fn default() -> Self {
         NodeState::Follower
@@ -17,6 +19,7 @@ pub struct RaftStateKey;
 
 impl RaftStateKey {
     pub const COMMIT_INDEX: &str = "commit_index";
+    pub const LAST_APPLIED: &str = "last_applied";
     pub const VOTED_FOR: &str = "voted_for";
     pub const CURRENT_TERM: &str = "current_term";
 }
@@ -37,9 +40,45 @@ pub struct RaftState {
 
     /// The highest log entry applied to the state machine.
     pub last_applied: Mutex<u64>,
+
+    // A stable storage for persisting raft state
+    stable: Box<dyn StableStore>,
 }
 
 impl RaftState {
+    pub fn new(stable: Box<dyn StableStore>) -> Self { 
+
+        let raft_state = Self {
+            votes: Mutex::new(0),
+            voted_for: Mutex::new(None),
+            current_term: Mutex::new(0),
+            commit_index: Mutex::new(0),
+            last_applied: Mutex::new(0),
+            stable,
+        };
+
+        let commit_index  = raft_state.stable.get(RaftStateKey::COMMIT_INDEX);
+        if let Ok(Some(idx)) = commit_index  {
+            raft_state.set_commit_index(idx);
+        }
+
+        let current_term  = raft_state.stable.get(RaftStateKey::CURRENT_TERM);
+        if let Ok(Some(term)) = current_term  {
+            raft_state.set_current_term(term);
+        }
+
+        let last_applied  = raft_state.stable.get(RaftStateKey::LAST_APPLIED);
+        if let Ok(Some(last_applied_idx)) = last_applied  {
+            raft_state.set_last_applied(last_applied_idx);
+        }
+
+        let voted_for  = raft_state.stable.get_str(RaftStateKey::VOTED_FOR);
+        if let Ok(node_id) = voted_for  {
+            raft_state.set_voted_for(node_id);
+        }
+
+        raft_state
+    }
     /// Retrieves the current term of the node.
     ///
     /// # Returns
@@ -56,6 +95,10 @@ impl RaftState {
     ///
     /// * `value: u64` - The value to set the current term to.
     pub fn set_current_term(&self, value: u64) {
+        if let Err(e) = self.stable.set(RaftStateKey::CURRENT_TERM, value){
+            error!("unable to persist current term to disk: {:?}", e)
+        };
+
         let mut current_term = self.current_term.lock().unwrap();
         *current_term = value;
     }
@@ -79,6 +122,10 @@ impl RaftState {
     ///
     /// * `value: u64` - The value to set the commit index to.
     pub fn set_commit_index(&self, value: u64) {
+        if let Err(e) = self.stable.set(RaftStateKey::COMMIT_INDEX, value){
+            error!("unable to persist commit index to disk: {:?}", e)
+        };
+
         let mut commit_index = self.commit_index.lock().unwrap();
         *commit_index = value;
     }
@@ -103,6 +150,9 @@ impl RaftState {
     ///
     /// * `value: u64` - The value to set the last applied index to.
     pub fn set_last_applied(&self, value: u64) {
+        if let Err(e) = self.stable.set(RaftStateKey::LAST_APPLIED, value){
+            error!("unable to persist last applied to disk: {:?}", e)
+        };
         let mut last_applied = self.last_applied.lock().unwrap();
         *last_applied = value;
     }
@@ -139,6 +189,10 @@ impl RaftState {
 
     /// Sets the identifier of the node that this node votes for.
     pub fn set_voted_for(&self, node_id: Option<String>) {
+        if let Err(e) = self.stable.set_str(RaftStateKey::VOTED_FOR, node_id.clone().unwrap_or("".to_string())){
+            error!("unable to persist voted_for to disk: {:?}", e)
+        };
+
         let mut voted_for = self.voted_for.lock().unwrap();
         *voted_for = node_id;
     }

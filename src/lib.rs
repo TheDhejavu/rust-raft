@@ -10,7 +10,6 @@ use ::log::*;
 use rand::Rng;
 use node::{Node, ReplicaNode};
 use stable::StableStore;
-use state::RaftStateKey;
 use storage::LogStore;
 use tokio::sync::RwLock;
 use crate::state::{NodeState, RaftState};
@@ -81,9 +80,6 @@ pub struct RaftNodeServer {
     /// A flag indicating whether a heartbeat has been received.
     received_heartbeat: Arc<AtomicBool>,
 
-    // A stable storage for persisting raft state
-    stable: Box<dyn StableStore>,
-
     /// Channel to receive incoming Raft RPCs.
     rpc_rx: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
 
@@ -95,8 +91,8 @@ pub struct RaftNodeServer {
     advance_commit_tx: tokio::sync::mpsc::Sender<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
     advance_commit_rx: tokio::sync::mpsc::Receiver<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
 
-    fsm_apply_tx: tokio::sync::mpsc::Sender<log::LogEntry>,
-    fsm_apply_rx: tokio::sync::mpsc::Receiver<log::LogEntry>,
+    fsm_apply_tx: tokio::sync::mpsc::Sender<Vec<log::LogEntry>>,
+    fsm_apply_rx: tokio::sync::mpsc::Receiver<Vec<log::LogEntry>>,
  
     // Leader specific queue for applying log entry based on FIFO
     inflight_entry_queue: VecDeque<log::LogEntry>,
@@ -105,6 +101,7 @@ pub struct RaftNodeServer {
     /// There should be a way to run the Raft Node server in a way that's shareable for multiple threads to call.
     api_message_rx: tokio::sync::mpsc::UnboundedReceiver<(RaftNodeServerMessage, tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
 }
+
 
 impl RaftNodeServer {
     pub async fn new(
@@ -120,35 +117,15 @@ impl RaftNodeServer {
         let shutdown_tx_rx = tokio::sync::mpsc::channel::<()>(1);
         let (advance_commit_tx, advance_commit_rx, ) = tokio::sync::mpsc::channel::<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>(1);
         let ( process_commit_tx,  process_commit_rx, ) = tokio::sync::mpsc::channel::<u64>(1);
-        let ( fsm_apply_tx,  fsm_apply_rx, ) = tokio::sync::mpsc::channel::<log::LogEntry>(1);
+        let ( fsm_apply_tx,  fsm_apply_rx, ) = tokio::sync::mpsc::channel::<Vec<log::LogEntry>>(100);
        
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
             .filter_module("sled", ::log::LevelFilter::Warn) 
             .init();
 
-        let raft_state =  Arc::new(RaftState {
-            votes: Mutex::new(0),
-            voted_for: Mutex::new(None),
-            current_term: Mutex::new(0),
-            commit_index: Mutex::new(0),
-            last_applied: Mutex::new(0),
-        });
+        let raft_state =  Arc::new(RaftState::new(stable));
 
-        let commit_index  = stable.get(RaftStateKey::COMMIT_INDEX);
-        if let Ok(Some(idx)) = commit_index  {
-            raft_state.set_commit_index(idx);
-        }
-
-        let current_term  = stable.get(RaftStateKey::CURRENT_TERM);
-        if let Ok(Some(term)) = current_term  {
-            raft_state.set_current_term(term);
-        }
-
-        let voted_for  = stable.get_str(RaftStateKey::VOTED_FOR);
-        if let Ok(node_id) = voted_for  {
-            raft_state.set_voted_for(node_id);
-        }
 
         Self {
             state: Arc::new(Mutex::new(NodeState::Follower)),
@@ -169,7 +146,6 @@ impl RaftNodeServer {
             received_heartbeat: Arc::new(AtomicBool::new(false)),
             fsm,
             logs: Arc::new(RwLock::new(logs)),
-            stable,
             rpc_rx,
             raft_state,
         }
@@ -193,9 +169,6 @@ impl RaftNodeServer {
 
     /// Sets the current term of the node to the specified value.
     fn set_current_term(&self, value: u64) {
-        if let Err(e) = self.stable.set(RaftStateKey::CURRENT_TERM, value){
-            error!("unable to persist current term to disk: {:?}", e)
-        };
         self.raft_state.set_current_term(value);
     }
 
@@ -206,9 +179,6 @@ impl RaftNodeServer {
 
     /// Sets the commit index to the given value.
     fn set_commit_index(&self, value: u64) {
-        if let Err(e) = self.stable.set(RaftStateKey::COMMIT_INDEX, value){
-            error!("unable to persist commit index to disk: {:?}", e)
-        };
         self.raft_state.set_commit_index(value);
     }
 
@@ -239,9 +209,6 @@ impl RaftNodeServer {
 
     /// Sets the identifier of the node that this node votes for.
     fn set_voted_for(&self, node_id: Option<String>) {
-        if let Err(e) = self.stable.set_str(RaftStateKey::VOTED_FOR, node_id.clone().unwrap_or("".to_string())){
-            error!("unable to persist voted_for to disk: {:?}", e)
-        };
         self.raft_state.set_voted_for(node_id);
     }
 
@@ -301,9 +268,10 @@ impl RaftNodeServer {
     /// 5. If `leaderCommit` is greater than `commitIndex`, set `commitIndex` 
     ///    to the minimum of `leaderCommit` and the index of the last new entry.
     async fn append_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
-        info!("recv.append_entries request.");
         // Check if term is outdated
-        if args.term < self.get_current_term() {
+        let current_term = self.get_current_term();
+        if args.term < current_term {
+            error!("term is outdated: args.term: {} local.term: {} ==/ ", args.term , current_term );
             return AppendEntriesResponse {
                 term: self.get_current_term(),
                 success: false,
@@ -316,9 +284,19 @@ impl RaftNodeServer {
             prev_log_term = log_entry.term;
         }
 
+
+        if args.entries.len() > 0 {
+            info!("args.prev_log_index: {} | local.prev_log_index: {} | args.prev_log_term: {} | local.prev_log_term: {}", 
+                args.prev_log_index, 
+                self.logs.read().await.last_index(),
+                args.prev_log_term,
+                prev_log_term
+            );
+        }
+
         // Check if log is consistent with new entries
         if args.prev_log_index > self.logs.read().await.last_index() as  u64 || prev_log_term != args.prev_log_term
-        {
+        {        
             return AppendEntriesResponse {
                 term: self.get_current_term(),
                 success: false,
@@ -326,16 +304,23 @@ impl RaftNodeServer {
         }
 
         // Remove any conflicting entries and append new entries
-        self.logs.write().await.delete_range(args.prev_log_index, args.prev_log_index + 1);
+        // self.logs.write().await.delete_range(args.prev_log_index, args.prev_log_index + 1);
 
         if args.commit_index > self.get_commit_index() {
-            self.set_commit_index(args.commit_index.min(self.get_last_log_index().await as  u64 - 1));
+            let index = args.commit_index.min(self.get_last_log_index().await as  u64);
+            self.set_commit_index(index);
+            self.process_committed_logs(index, HashMap::new()).await;
         }
 
         // Update term and leader id
         self.set_current_term(args.term);
         if args.entries.len() > 0 {
-            
+            info!("recv.logs: {}", args.entries.len());
+            let converted_entries: Vec<log::LogEntry> = args.entries.iter()
+                .filter_map(|entry: &raft::LogEntry| log::LogEntry::from_rpc_raft_log(entry.clone())) // Removed redundant Some
+                .collect();
+        
+            _ = self.logs.write().await.store_logs(&converted_entries[..]);
         }
 
         return AppendEntriesResponse {
@@ -436,15 +421,17 @@ impl RaftNodeServer {
         }
     }
     pub async fn start(&mut self) {   
-        let state = self.get_state().unwrap();
+        if let Ok(Some(state)) = self.get_state() {
+            // become follower
+            self.become_follower();
+            info!("server.start.state: {:?}", state);
 
-        // become follower
-        self.become_follower();
-        info!("server.start.state: {:?}", state.unwrap());
 
-        self.run().await;
+           self.run().await;
+        } else {
+            error!("Failed to start raft server");
+        };
     }
-
     async fn run_follower_loop(&mut self) {
         info!("server.follower.loop");
         let mut election_timeout = self.random_election_timeout();
@@ -457,7 +444,7 @@ impl RaftNodeServer {
                         break;
                     }
     
-                    info!("Running as {:?}...", current_state.clone().unwrap()); 
+                    // info!("Running as {:?}...", current_state.clone().unwrap()); 
     
                     tokio::select! {
                         msg = self.api_message_rx.recv() => { 
@@ -482,9 +469,6 @@ impl RaftNodeServer {
                                 },
                                 None => {},
                             }
-                        },
-                        idx = self.process_commit_rx.recv() => { 
-                            // response_sender.send(Err(RaftError::NotLeader)).await
                         },
                         rpc_result = self.rpc_rx.recv() => match rpc_result {
                             Some((request, response_sender)) => {
@@ -688,6 +672,7 @@ impl RaftNodeServer {
                         result = self.advance_commit_rx.recv() => { 
                             match result {
                                 Some((_, response_sender))  => {
+                                    info!("advance commit index ==/ ");
                                     // Advance leader commit Index by calculating the matching indexes of the replica nodes
                                     let current_commit_index = self.raft_state.get_commit_index();
                                     if let Some(majority_index) = self.majority_replicated_index().await {
@@ -697,14 +682,41 @@ impl RaftNodeServer {
                                         }
                                     }
                                     _ = response_sender.send(Ok(())).await;
+                                    info!("advance commit index  done ==/ ");
                                 },
                                 None => {},
                             }
                         },
-                        idx = self.process_commit_rx.recv() => { 
+                        _ = self.process_commit_rx.recv() => {
+                            info!("process commit  ==/ ");
                             let commit_index = self.get_commit_index();
                             
-                        },
+                            let mut inflight_logs: HashMap<u64, log::LogEntry> = HashMap::new();
+                            let mut last_commit_index = 0;
+                        
+                            // Iterate over the inflight_entry_queue to populate inflight_logs and determine last_commit_index.
+                            let mut pop_count = 0;
+                            for log_entry in &self.inflight_entry_queue {
+                                if log_entry.index > commit_index {
+                                    break;
+                                }
+                        
+                                println!("Processing entry: {:?}", log_entry);
+                        
+                                inflight_logs.insert(log_entry.index, log_entry.clone());
+                                last_commit_index = log_entry.index;
+                                pop_count += 1;
+                            }
+                        
+                            if !inflight_logs.is_empty() {
+                                self.process_committed_logs(last_commit_index, inflight_logs).await;
+                                
+                                // Remove the processed logs from inflight_entry_queue.
+                                for _ in 0..pop_count {
+                                    self.inflight_entry_queue.pop_front();
+                                }
+                            }
+                        },                        
                         _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the leader loop");
                             self.set_state(NodeState::Stopped);
@@ -851,6 +863,7 @@ impl RaftNodeServer {
     /// Calculate the highest index that has been replicated on a majority of them.
     async fn majority_replicated_index(&self) -> Option<u64> {
         if let Some(replicas) = self.replica_nodes.as_ref() {
+            info!("majority_replicated_index.block  ==/ ");
             // Obtain match indexes from all replicas
             let mut match_indexes: Vec<u64> = futures::future::join_all(replicas.values().map(|replica| {
                 async {
@@ -858,6 +871,7 @@ impl RaftNodeServer {
                     locked_replica.match_index
                 }
             })).await;
+            info!("majority_replicated_index.unblock  ==/ ");
             
             // Sort the match indexes
             match_indexes.sort_unstable();
@@ -870,7 +884,42 @@ impl RaftNodeServer {
         None
     }
 
-    async fn process_committed_logs(&mut self) {
-
+    async fn process_committed_logs(&mut self, last_commit_index: u64, committed_logs: HashMap<u64, log::LogEntry>) {
+        let last_applied = self.get_last_applied();
+        info!("Last Applied: {}", last_applied);
+        info!("Last Commit Index: {}", last_commit_index);
+        if last_commit_index <= last_applied {
+            error!("unable to apply log because commit index <= last applied. ignore!");
+            return;
+        }
+    
+        let mut batch_logs: Vec<log::LogEntry> = Vec::new();
+    
+        for idx in (last_applied + 1)..=last_commit_index {
+            if let Some(log) = committed_logs.get(&idx) {
+                if log.index > last_applied && log.index <= last_commit_index {
+                    batch_logs.push(log.clone());
+                }
+            } else {
+               let result = self.logs.read().await.get_log(idx);
+               match result {
+                Ok(Some(entry)) =>  batch_logs.push(entry),
+                Ok(None)=> error!("empty log entry"),
+                Err(e) => error!("unable to bach log {:?}", e),
+               }
+            }
+        }
+    
+        if !batch_logs.is_empty() {
+            // if let Err(e) = self.fsm_apply_tx.send(batch_logs).await {
+            //     error!("Failed to send log entry to fsm_apply_tx: {}", e);
+            // }
+            for log in batch_logs {
+                self.fsm.apply(&log).await;
+            }
+        }
+    
+        self.set_last_applied(last_commit_index);
     }
+    
 }
