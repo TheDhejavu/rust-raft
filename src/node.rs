@@ -72,14 +72,14 @@ pub struct ReplicaNode {
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
     shutdown_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>>,
 
-    pub entry_replica_tx: tokio::sync::mpsc::Sender<()>, 
-    entry_replica_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    pub entry_replica_tx: tokio::sync::mpsc::UnboundedSender<()>, 
+    entry_replica_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
 }
 
 impl ReplicaNode {
     pub async fn new(node: Node, current_term: u64,  next_index: u64, heartbeat_interval: u64) -> Result<Self, RaftError> {
         let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (entry_replica_tx, entry_replica_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (entry_replica_tx, entry_replica_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let server_addr = node.address.clone();
         let grpc_transport = RaftGrpcTransport::new(server_addr.as_str()).await;
         
@@ -223,11 +223,12 @@ impl ReplicaNode {
         }
         let current_term = raft_state.get_current_term();
         info!("node.replica.run <> {}", node_address); 
-    
+        
+        let mut locked_shutdown = shutdown_receiver.lock().await;
+        let mut locked_entry = entry_receiver.lock().await;
+
         loop {
-            let mut locked_shutdown = shutdown_receiver.lock().await;
-            let mut locked_entry = entry_receiver.lock().await;
-    
+           
             tokio::select! {
                 _ = locked_shutdown.recv() => { 
                     let _ = stop_heartbeat_tx.send(()).await;
@@ -236,7 +237,7 @@ impl ReplicaNode {
                 _ = locked_entry.recv() => {
                     info!("Start Replication ==== / ");
                     let last_log_index = logs.read().await.last_index();
-                    // get initial values outside of the loop
+                   
                     let mut next_index;
                     let leader_id;
                     {
@@ -246,9 +247,8 @@ impl ReplicaNode {
                     }
                     
                     let mut retries = 10;
-                    let mut backoff_duration = Duration::from_millis(100); 
-                    
-                    // replicate starting from the next_index to the current last_index
+                    let mut backoff_duration = Duration::from_millis(50); 
+    
                     while next_index <= last_log_index && retries > 0 {
                         if next_index <= 0 {
                             break
@@ -299,8 +299,7 @@ impl ReplicaNode {
                                     }
                                    
                                 } else {
-                                    if next_index > 0 {
-                                        
+                                    if next_index > 0 {    
                                         next_index -= 1;
                                     }
                                     backoff_duration = Duration::from_millis(backoff_duration.as_millis() as u64 * 2);
@@ -316,7 +315,11 @@ impl ReplicaNode {
                         tokio::time::sleep(backoff_duration).await;
                         retries -= 1;
                     }
-                    info!(" == Completed Replication ==== / ");
+                    if retries == 0 {
+                        info!(" failed to replicate log with no retries left ==== / ");
+                    } else {
+                        info!(" == Completed Replication ==== / ");
+                    }
                 },
                 
                 _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}

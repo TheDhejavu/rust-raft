@@ -157,6 +157,11 @@ impl RaftNodeServer {
         self.leader_id.is_some() && self.leader_id.clone().unwrap() == self.id
     }
 
+    /// Sets the current leaderid
+    pub fn set_leader_id(&mut self, leader_id: String) {
+        self.leader_id = Some(Arc::new(leader_id));
+    }
+
     /// Return true if current node is the leader
     pub fn server_id(&self) -> Arc<String> {
         self.id.clone()
@@ -268,66 +273,87 @@ impl RaftNodeServer {
     /// 5. If `leaderCommit` is greater than `commitIndex`, set `commitIndex` 
     ///    to the minimum of `leaderCommit` and the index of the last new entry.
     async fn append_entries(&mut self, args: AppendEntriesRequest) -> AppendEntriesResponse {
-        // Check if term is outdated
+        // Acquire the current term of this node.
         let current_term = self.get_current_term();
+    
+        // STEP 1: Verifying Term Consistency
+        // In Raft, all nodes synchronize based on terms. If the incoming term is outdated (i.e., less than the current term),
+        // then we should reject the request to ensure consistency. This is vital because an outdated leader shouldn't 
+        // overwrite the logs of a more up-to-date node.
         if args.term < current_term {
-            error!("term is outdated: args.term: {} local.term: {} ==/ ", args.term , current_term );
+            error!("The incoming term is outdated. Current local term: {}. Incoming term: {}", current_term, args.term);
             return AppendEntriesResponse {
                 term: self.get_current_term(),
                 success: false,
             };
         }
-
-        let prev_log_entry = self.logs.read().await.get_log(args.prev_log_index);
-        let mut prev_log_term: u64 = 0;
-        if let Ok(Some(log_entry)) = prev_log_entry {
-            prev_log_term = log_entry.term;
+    
+        if args.prev_log_index > 0 {
+            // Fetch the server's most recent log state to determine if it's consistent with the leader's perspective.
+            let last_index = self.logs.read().await.last_index();
+            let last_entry = self.logs.read().await.get_log(last_index);
+            let mut last_term: u64 = 0;
+            if let Ok(Some(log_entry)) = last_entry {
+                last_term = log_entry.term;
+            }
+    
+            let mut prev_log_term: u64 = 0;
+            if args.prev_log_index == last_index {
+                prev_log_term = last_term;
+            } else {
+                let last_log_entry = self.logs.read().await.get_log(args.prev_log_index);
+                if let Ok(Some(entry)) = last_log_entry {
+                    prev_log_term = entry.term;
+                };
+            }
+    
+            // STEP 2: Confirm Log Consistency
+            // Here we're ensuring that the logs of the follower are consistent with what the leader believes.
+            // If they're not consistent, the follower should reject the request to ensure that its logs don't 
+            // diverge from the leader's logs.
+            if args.prev_log_term != prev_log_term {
+                return AppendEntriesResponse {
+                    term: self.get_current_term(),
+                    success: false,
+                };
+            }
         }
-
-
+    
         if args.entries.len() > 0 {
-            info!("args.prev_log_index: {} | local.prev_log_index: {} | args.prev_log_term: {} | local.prev_log_term: {}", 
-                args.prev_log_index, 
-                self.logs.read().await.last_index(),
-                args.prev_log_term,
-                prev_log_term
-            );
+            // STEP 3: Resolving Log Conflicts
+            // It's possible that the follower has some log entries that conflict with what the leader is sending.
+            // In Raft, logs flow from leaders to follower and they are considered to be upto-date. Thus, conflicting entries in the follower's 
+            // log should be deleted and replaced with the entries from the leader.
+            // TODO: Implement this logic to remove conflicting entries.
+    
+            // STEP 4: Appending New Entries
+            // Once any conflicts have been resolved, we can proceed to append new entries to the log. 
+            // These are the entries that the leader has but the follower does not.
+            let converted_entries: Vec<log::LogEntry> = args.entries.iter()
+                .filter_map(|entry: &raft::LogEntry| log::LogEntry::from_rpc_raft_log(entry.clone()))
+                .collect();
+            _ = self.logs.write().await.store_logs(&converted_entries[..]);
         }
-
-        // Check if log is consistent with new entries
-        if args.prev_log_index > self.logs.read().await.last_index() as  u64 || prev_log_term != args.prev_log_term
-        {        
-            return AppendEntriesResponse {
-                term: self.get_current_term(),
-                success: false,
-            };
-        }
-
-        // Remove any conflicting entries and append new entries
-        // self.logs.write().await.delete_range(args.prev_log_index, args.prev_log_index + 1);
-
-        if args.commit_index > self.get_commit_index() {
-            let index = args.commit_index.min(self.get_last_log_index().await as  u64);
+    
+        // STEP 5: Update Commit Index
+        // The leader might have committed some entries that the follower hasn't. This step ensures that 
+        // the follower updates its commit index to reflect these newly committed entries, but without 
+        // going beyond the last entry it has.
+        if args.commit_index > 0 && args.commit_index > self.get_commit_index() {
+            let index = args.commit_index.min(self.get_last_log_index().await as u64);
             self.set_commit_index(index);
             self.process_committed_logs(index, HashMap::new()).await;
         }
-
-        // Update term and leader id
+    
+        // Synchronize the follower's perspective of the current term and leader ID with the information from the leader.
         self.set_current_term(args.term);
-        if args.entries.len() > 0 {
-            info!("recv.logs: {}", args.entries.len());
-            let converted_entries: Vec<log::LogEntry> = args.entries.iter()
-                .filter_map(|entry: &raft::LogEntry| log::LogEntry::from_rpc_raft_log(entry.clone())) // Removed redundant Some
-                .collect();
-        
-            _ = self.logs.write().await.store_logs(&converted_entries[..]);
-        }
-
+        self.set_leader_id(args.leader_id);
+    
         return AppendEntriesResponse {
             term: self.get_current_term(),
             success: true,
         };
-    }
+    }    
 
     /// Handles the request for votes.
     ///
@@ -336,45 +362,88 @@ impl RaftNodeServer {
     /// - If `votedFor` is null or `candidateId`, and the candidate’s log 
     ///   is at least as up-to-date as the receiver’s log, grant the vote.
     async fn request_vote(&mut self, args: RequestVoteRequest) -> RequestVoteResponse {
-        // Check if term is outdated
+        // STEP 1: Term Verification
+        // Ensure that the term of the incoming request is not outdated. In Raft, a node should reject vote requests
+        // from candidates with an outdated term. This ensures that only candidates with up-to-date information
+        // can be elected as leader.
         if args.term < self.get_current_term() {
             return RequestVoteResponse {
                 term: self.get_current_term(),
                 vote_granted: false,
             };
-        } 
-
+        }
+    
+        // If the candidate's term is greater than the current term, then our node's information is outdated.
+        // We need to update our term, revert to follower state, and reset our voted_for status to ensure we
+        // can participate in the new election round.
         if args.term > self.get_current_term() {
             self.set_current_term(args.term);
             self.become_follower();
             self.set_voted_for(None);
         }
-
-        // Check if candidate's log is at least as up-to-date as receiver's log
-        let last_entry = self.logs.read().await.get_log(self.logs.read().await.last_index());
+    
+        let last_index = self.logs.read().await.last_index() as u64;
+        let last_entry = self.logs.read().await.get_log(last_index);
+        let mut last_term= 0;
         if let Ok(Some(entry)) = last_entry {
-            if args.last_log_term < entry.term || (args.last_log_term == entry.term && args.last_log_index < self.logs.read().await.last_index() as  u64) {
-                return RequestVoteResponse {
-                    term: self.get_current_term(),
-                    vote_granted: false,
-                };
-            }
+            last_term = entry.term;
         }
-       
-        if self.get_voted_for() != None  {
+
+        // STEP 2: Vote Uniqueness Check
+        // Each node can vote for only one candidate per term. If our node has already voted in this term,
+        // it must reject any subsequent requests for votes.
+        if self.get_voted_for().is_some() && self.get_current_term() == args.term {
+            info!("Vote request denied because this node has already voted in the current term. Candidate's last log index: {}, Local last log index: {}. Candidate's term: {}, Local last term: {}.", 
+                args.last_log_index, 
+                last_index,
+                args.term,
+                last_term
+            );
             return RequestVoteResponse {
                 term: self.get_current_term(),
                 vote_granted: false,
             };
         }
 
+        // STEP 3: Log Term Consistency Check
+        // Ensure our log's term is not more recent than the candidate's.
+        if args.last_log_term < last_term {
+            info!("Vote rejected due to invalid last log term from the candidate. Candidate's last log term: {}, Local last log term: {}.", 
+                args.last_log_term, 
+                last_term
+            );
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+        
+        // STEP 4: Log Consistency Check
+        // The candidate's log must be at least as up-to-date as the log of the node it's asking a vote from.
+        // This ensures that only candidates with up-to-date logs are eligible to become leaders.
+        if last_term == args.last_log_term && last_index > args.last_log_index {
+            info!("Vote rejected due to outdated log term from the candidate. Candidate's last log index: {}, Local last log index: {}.", 
+                args.last_log_index, 
+                last_index
+            );
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+       
+
+        // STEP 5: Granting Vote
+        // If the above conditions are satisfied, the node can grant its vote to the candidate. 
+        // We then update our voted_for field to the candidate's ID and synchronize our current term with the candidate's term.
         self.set_voted_for(Some(args.candidate_id.into()));
+        self.set_current_term(args.term);
+
         return RequestVoteResponse {
             term: self.get_current_term(),
             vote_granted: true,
         };
-    }
-    
+    }    
     /// Retrieves the current state of the node.
     ///
     /// This function attempts to lock and access the node's state.
@@ -398,8 +467,9 @@ impl RaftNodeServer {
         }
     }
     
-    async fn run(&mut self) {
+    async fn start(&mut self) {
         info!("server.loop.start");
+
         loop {
             let state = self.get_state();
             match state {
@@ -420,14 +490,13 @@ impl RaftNodeServer {
             };
         }
     }
-    pub async fn start(&mut self) {   
+    pub async fn run(&mut self) {   
         if let Ok(Some(state)) = self.get_state() {
             // become follower
             self.become_follower();
             info!("server.start.state: {:?}", state);
 
-
-           self.run().await;
+           self.start().await;
         } else {
             error!("Failed to start raft server");
         };
@@ -447,6 +516,7 @@ impl RaftNodeServer {
                     // info!("Running as {:?}...", current_state.clone().unwrap()); 
     
                     tokio::select! {
+                        
                         msg = self.api_message_rx.recv() => { 
                             match msg {
                                 Some((request, response_sender))  => {
@@ -720,7 +790,7 @@ impl RaftNodeServer {
                         _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the leader loop");
                             self.set_state(NodeState::Stopped);
-                            return;
+                            break;
                         },
                         
                     }
@@ -826,40 +896,45 @@ impl RaftNodeServer {
 
     async fn notify_all_replica_of_new_entry(&mut self)  {
         for (_, node) in self.replica_nodes.as_mut().unwrap() {
-            if let Err(e) = node.lock().await.entry_replica_tx.send(()).await {
+            if let Err(e) = node.lock().await.entry_replica_tx.send(()) {
                 error!("unable to notify replica of new log entry: {}", e);
             }
         }
     }
 
-    async fn handle_log_entry(&mut self, data: Vec<u8>)-> Result<(), RaftError>{
-        let new_log = log::LogEntry{
+    async fn handle_log_entry(&mut self, data: Vec<u8>) -> Result<(), RaftError> {
+        let new_log_index = self.get_last_log_index().await + 1;
+        let new_log = log::LogEntry {
             log_entry_type: log::LogEntryType::LogCommand,
-            index: self.get_last_log_index().await + 1,
+            index: new_log_index,
             data,
             term: self.get_current_term(),
         };
-        info!("New log entry {:?}", new_log);
-
-        // track log inflight for processing when committed (only applicable to the leader).
+        info!("Creating new log entry: {:?}", new_log);
+    
+        // // Track log inflight for processing when committed (only applicable to the leader).
         self.inflight_entry_queue.push_back(new_log.clone());
-
+    
+        // // Attempt to store the new log entry.
         let store_log_result = {
             let mut log_writer = self.logs.write().await;
             log_writer.store_log(&new_log)
         };
-        
-        if let Err(e) = store_log_result {
-            error!("unable to store log {:?}", e);
-            self.become_follower();
-            return Err(RaftError::LogFailed);
+
+        match store_log_result {
+            Ok(_) => {
+                info!("Successfully stored log entry at index {}", new_log_index);
+                self.notify_all_replica_of_new_entry().await;
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to store log entry: {:?}", e);
+                self.become_follower();
+                Err(RaftError::LogFailed)
+            }
         }
-
-        self.notify_all_replica_of_new_entry().await;
-        
-        Ok(())
     }
-
+    
     /// Calculate the highest index that has been replicated on a majority of them.
     async fn majority_replicated_index(&self) -> Option<u64> {
         if let Some(replicas) = self.replica_nodes.as_ref() {
@@ -888,38 +963,48 @@ impl RaftNodeServer {
         let last_applied = self.get_last_applied();
         info!("Last Applied: {}", last_applied);
         info!("Last Commit Index: {}", last_commit_index);
+        
         if last_commit_index <= last_applied {
-            error!("unable to apply log because commit index <= last applied. ignore!");
+            error!("Unable to apply log because commit index <= last applied. Ignore!");
             return;
         }
     
-        let mut batch_logs: Vec<log::LogEntry> = Vec::new();
-    
+        let mut batched_logs = Vec::new();
         for idx in (last_applied + 1)..=last_commit_index {
-            if let Some(log) = committed_logs.get(&idx) {
-                if log.index > last_applied && log.index <= last_commit_index {
-                    batch_logs.push(log.clone());
-                }
-            } else {
-               let result = self.logs.read().await.get_log(idx);
-               match result {
-                Ok(Some(entry)) =>  batch_logs.push(entry),
-                Ok(None)=> error!("empty log entry"),
-                Err(e) => error!("unable to bach log {:?}", e),
-               }
+            match committed_logs.get(&idx) {
+                Some(log)  => {
+                    if log.index > last_applied && log.index <= last_commit_index  {
+                      batched_logs.push(log.clone());
+                    }  else {
+                        break
+                    }
+                },
+                None => {
+                    match self.logs.read().await.get_log(idx) {
+                        Ok(Some(entry)) => batched_logs.push(entry),
+                        Ok(None) => {
+                            error!("Empty log entry");
+                            break;  
+                        },
+                        Err(e) => {
+                            error!("Unable to batch log: {:?}", e);
+                            break;  
+                        },
+                    }
+                },
+                _ => {}
             }
         }
     
-        if !batch_logs.is_empty() {
-            // if let Err(e) = self.fsm_apply_tx.send(batch_logs).await {
-            //     error!("Failed to send log entry to fsm_apply_tx: {}", e);
-            // }
-            for log in batch_logs {
+        if !batched_logs.is_empty() {
+            for log in batched_logs {
                 self.fsm.apply(&log).await;
             }
         }
     
         self.set_last_applied(last_commit_index);
+        info!("Logs applied up to index {}", last_commit_index);
     }
+    
     
 }

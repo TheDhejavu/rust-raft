@@ -12,14 +12,16 @@ use rust_raft::{
         RaftTransportRequest, RaftTransportResponse, RaftGrpcTransportServer,
     }, config::Config, node::Node, datastore::{RaftSledLogStore, RaftSledKVStore}, RaftNodeServerMessage, error::RaftError
 };
+use tokio::time::{sleep, Duration};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use clap::{App, Arg, SubCommand};
 use serde_derive::{Serialize, Deserialize};
 pub use database::MyDatabase;
-use std::sync::Arc;
+use std::{sync::Arc};
 use tokio::sync::RwLock;
-
+use rand::Rng;
+use reqwest;
 mod database;
 
 struct FSM {
@@ -72,6 +74,11 @@ fn setup_cli() -> clap::ArgMatches<'static> {
                 .arg(Arg::with_name("http-port").short("h").long("http-port").value_name("HTTP_PORT").required(true).takes_value(true))
                 .arg(Arg::with_name("id").short("i").long("id").value_name("IDENTIFIER").required(true).takes_value(true))
                 .arg(Arg::with_name("peers").short("p").long("peers").value_name("PEERS").required(true).takes_value(true))
+        )
+        .subcommand(
+            SubCommand::with_name("store")
+                .about("Send multiple store requests to the leader")
+                .arg(Arg::with_name("leader-addr").short("l").long("leader-addr").value_name("LEADER_ADDRESS").required(true).takes_value(true))
         )
         .get_matches()
 }
@@ -127,16 +134,26 @@ async fn main() {
 
             // Run the server.
             let addr = format!("127.0.0.1:{}", http_port.to_string());
-            let api_server = server.run(&addr);
-           
+            
+            // Wait for a shutdown signal (e.g., SIGTERM)
+            let shutdown_handle_listener = tokio::spawn(async move {
+                tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+                info!("Shutdown signal received, notifying all tasks to shut down...");
+                sleep(Duration::from_secs(5)).await;
+                std::process::exit(0);
+            });
+
             // Start Raft node, GRPC server and API API
             _ = tokio::join!(
-                raft_node.start(),
+                raft_node.run(),
                 grpc_server.run(server_addr),
-                api_server
-            );
-
-        
+                server.run(&addr),
+                shutdown_handle_listener,
+            )
+        },
+        ("store", Some(cli)) => {
+            let leader_addr = cli.value_of("leader-addr").unwrap();
+            send_store_requests(leader_addr).await;
         },
         _ => {
             eprintln!("Invalid command. Use --help for more info.");
@@ -144,6 +161,43 @@ async fn main() {
     }
 }
 
+const NUM_REQUESTS: usize = 100;
+
+async fn send_store_requests(leader_addr: &str) {
+    let client = reqwest::Client::new();
+
+    for _ in 0..NUM_REQUESTS {
+        let key = generate_random_string(5);
+        let value = generate_random_string(10);
+
+        let res = client.post(&format!("{}/store", leader_addr))
+            .json(&RequestBody {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .send()
+            .await;
+
+        match res {
+            Ok(response) => {
+                if response.status().is_success() {
+                    println!("Stored key-value pair: {}-{}", key, value);
+                } else {
+                    println!("Failed to store key-value pair: {}-{}. Status: {:?}", key, value, response.status());
+                }
+            },
+            Err(e) => {
+                println!("Failed to send request: {}", e);
+            }
+        }
+    }
+}
+
+fn generate_random_string(length: usize) -> String {
+    let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().collect();
+    let mut rng = rand::thread_rng();
+    (0..length).map(|_| chars[rng.gen_range(0..chars.len())]).collect()
+}
 
 pub struct WebServer {
     message_tx: mpsc::UnboundedSender<(RaftNodeServerMessage, mpsc::Sender<Result<(), RaftError>>)>,
@@ -176,6 +230,7 @@ impl WebServer {
                 }))
                 .route("/inspect", web::get().to(inspect_handler))
                 .route("/store", web::post().to(store_handler))
+                .route("/delete", web::delete().to(delete_handler))
         })
         .bind(addr)?
         .run()
@@ -207,44 +262,52 @@ struct RequestBody {
     key: String,
     value: String,
 }
-
 async fn store_handler(
     data: web::Data<AppState>,
     req_body: web::Json<RequestBody>,
-) -> Result<HttpResponse, Error> {
+) -> Result<HttpResponse, actix_web::Error> {
     let raft_message_tx = &data.message_tx;
-
     let command = StateMachineCommand::Add { key: req_body.key.to_string(), value: req_body.value.to_string() };
-    match bincode::serialize(&command) {
-        Ok(data) => {
-            let (tx, mut rx) =  mpsc::channel::<Result<(), RaftError>>(1);
-            match raft_message_tx.send((RaftNodeServerMessage::Apply(data), tx)) {
-                Ok(_) => {
-                    match rx.recv().await {
-                        Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
-                        Some(Err(e)) => {
-                            match e {
-                                RaftError::NotLeader => {
-                                    Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"})))
-                                }
-                                _ => {
-                                    Ok(HttpResponse::InternalServerError().finish())
-                                }
-                            }
-                        }
-                        _ => {
-                            Ok(HttpResponse::InternalServerError().finish())
-                        },
-                    }
-                },
-                Err(e) =>  {
-                    error!("unable to store data: {}", e);
-                    Ok(HttpResponse::InternalServerError().finish())
-                }
-            }
-        }
-        Err(_) => {
-            Ok(HttpResponse::InternalServerError().finish())
-        }
+
+    let data = bincode::serialize(&command)
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Serialization error"))?;
+    
+    let (tx, mut rx) = mpsc::channel::<Result<(), RaftError>>(1);
+
+    raft_message_tx.send((RaftNodeServerMessage::Apply(data), tx))
+        .map_err(|e| {
+            error!("unable to store data: {}", e);
+            actix_web::error::ErrorInternalServerError("Internal error")
+        })?;
+    
+    match rx.recv().await {
+        Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
+        Some(Err(RaftError::NotLeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
+        _ => Ok(HttpResponse::InternalServerError().finish()),
+    }
+}
+
+async fn delete_handler(
+    data: web::Data<AppState>,
+    req_body: web::Json<RequestBody>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let raft_message_tx = &data.message_tx;
+    let command = StateMachineCommand::Remove { key: req_body.key.to_string() };
+
+    let data = bincode::serialize(&command)
+        .map_err(|_| actix_web::error::ErrorInternalServerError("Serialization error"))?;
+    
+    let (tx, mut rx) = mpsc::channel::<Result<(), RaftError>>(1);
+    
+    raft_message_tx.send((RaftNodeServerMessage::Apply(data), tx))
+        .map_err(|e| {
+            error!("unable to store data: {}", e);
+            actix_web::error::ErrorInternalServerError("Internal error")
+        })?;
+
+    match rx.recv().await {
+        Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
+        Some(Err(RaftError::NotLeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
+        _ => Ok(HttpResponse::InternalServerError().finish()),
     }
 }
