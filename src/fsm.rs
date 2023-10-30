@@ -1,6 +1,7 @@
 use crate::log::LogEntry;
+use async_trait::async_trait;
 
-pub trait FSM: Send + 'static {
-    fn apply(&self, log: &LogEntry) -> Box<dyn std::any::Any>;
+#[async_trait]
+pub trait FSM: Send + Sync  + 'static {
+    async fn apply(&self, log: &LogEntry) -> Box<dyn std::any::Any>;
 }
-

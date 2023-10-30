@@ -1,5 +1,5 @@
 use crate::{log::LogEntry,storage::LogStore, error::StoreError};
-use std::collections::HashMap;
+use std::{collections::HashMap, vec};
 
 pub struct MockLogStore {
     pub logs: HashMap<u64, LogEntry>,
@@ -12,8 +12,12 @@ impl MockLogStore {
 }
 
 impl LogStore for MockLogStore {
-    fn get_log(&self, idx: u64) -> Option<LogEntry> {
-        self.logs.get(&idx).cloned()
+    fn get_log(&self, idx: u64) -> Result<Option<LogEntry>, StoreError> {
+        let result = self.logs.get(&idx).cloned();
+        Ok(result)
+    }
+    fn get_logs_from_range(&self, min_idx: u64, max_idx: u64)-> Result<(Vec<LogEntry>), StoreError> {
+        Ok((vec![]))
     }
 
     fn store_log(&mut self, log: &LogEntry) -> Result<(), StoreError> {

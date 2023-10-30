@@ -1,7 +1,9 @@
+use crate::raft;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogEntryType {
-    CommandLog,
-    ConfigurationLog,
+    LogCommand,
+    ConfCommand,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,8 +24,8 @@ impl LogEntry {
         
         // Use a single byte for the log entry type
         let type_byte = match self.log_entry_type {
-            LogEntryType::CommandLog => 0u8,
-            LogEntryType::ConfigurationLog => 1u8,
+            LogEntryType::LogCommand => 0u8,
+            LogEntryType::ConfCommand => 1u8,
         };
         bytes.push(type_byte);
         
@@ -44,8 +46,8 @@ impl LogEntry {
         let term = u64::from_be_bytes(bytes[8..16].try_into().ok()?);
         
         let log_entry_type = match bytes[16] {
-            0 => LogEntryType::CommandLog,
-            1 => LogEntryType::ConfigurationLog,
+            0 => LogEntryType::LogCommand,
+            1 => LogEntryType::ConfCommand,
             _ => return None,
         };
         
@@ -59,6 +61,35 @@ impl LogEntry {
 
         Some(LogEntry { index, term, log_entry_type, data })
     }
+
+    pub fn from_rpc_raft_log(entry: raft::LogEntry) -> Option<LogEntry> {
+        let log_entry_type = match entry.log_entry_type {
+            x if x == raft::LogEntryType::LogCommand as i32 => Some(LogEntryType::LogCommand),
+            x if x == raft::LogEntryType::ConfCommand as i32 => Some(LogEntryType::ConfCommand),
+            _ => None,  
+        };
+
+        log_entry_type.map(|log_type| {
+            LogEntry {
+                index: entry.index,
+                term: entry.term,
+                log_entry_type: log_type,
+                data: entry.data,
+            }
+        })
+    }
+
+    pub fn to_rpc_raft_log(self)  -> raft::LogEntry {
+        raft::LogEntry  {
+            index: self.index,
+            term: self.term,
+            log_entry_type: match self.log_entry_type {
+                LogEntryType::LogCommand => 0,  
+                LogEntryType::ConfCommand => 1,
+            },
+            data: self.data.clone(),
+        }
+    }
 }
 
 
@@ -71,7 +102,7 @@ mod tests {
         let log_entry = LogEntry {
             index: 12345,
             term: 67890,
-            log_entry_type: LogEntryType::CommandLog,
+            log_entry_type: LogEntryType::LogCommand,
             data: vec![1, 2, 3, 4, 5],
         };
 
@@ -91,7 +122,7 @@ mod tests {
         let expected_log_entry = LogEntry {
             index: 12345,
             term: 67890,
-            log_entry_type: LogEntryType::CommandLog,
+            log_entry_type: LogEntryType::LogCommand,
             data: vec![1, 2, 3, 4, 5],
         };
 

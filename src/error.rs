@@ -9,6 +9,8 @@ pub enum RaftError {
     ConnectionRefusedError,
     UnableToUnlockNodeState,
     HeartbeatFailure,
+    LogFailed,
+    NotLeader,
 }
 
 impl Error for RaftError {}
@@ -20,6 +22,8 @@ impl std::fmt::Display for RaftError {
             RaftError::UnableToUnlockNodeState=> write!(f, "unable to unlock node state"),
             RaftError::ConnectionRefusedError=> write!(f, "unable to connect to peer"),
             RaftError::HeartbeatFailure=> write!(f, "heartbeat failed"),
+            RaftError::LogFailed=> write!(f, "failed to handle log"),
+            RaftError::NotLeader=> write!(f, "not a leader"),
         }
     }
 }
@@ -27,6 +31,7 @@ impl std::fmt::Display for RaftError {
 #[derive(Debug, Clone)]
 pub enum StoreError {
     InsertionError(String),
+    Error(String),
 }
 
 
