@@ -16,3 +16,6 @@ Raft is a consensus algorithm for distributed systems, it is inspired by the com
 - Detailed explanation of each concepts ****✔****
 - Mathematical Proofs (if there is any ) for correctness of the algorithm ?****✔****
 - Visualizations  ****✔****
+
+
+### 

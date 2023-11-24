@@ -1,4 +1,4 @@
-use sled::{Db, IVec};
+use sled::Db;
 use std::str;
 
 pub struct MyDatabase {
