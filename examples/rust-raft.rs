@@ -290,8 +290,6 @@ async fn store_handler(
     }
 }
 
-
-
 #[derive(Serialize, Deserialize, Debug)]
 struct DeleteRequestBody {
     key: String,

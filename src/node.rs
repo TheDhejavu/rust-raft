@@ -80,7 +80,8 @@ pub async fn send_timeout_now(
     locked_transport.timeout_now(request).await
 }
 
-pub async fn transfer_leadership(node: Arc<Node>) {
+// 3.10 Leadership transfer extension
+pub async fn transfer_leadership(target_node: Arc<Node>) {
     
 }
 

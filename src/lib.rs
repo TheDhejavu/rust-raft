@@ -1278,8 +1278,7 @@ impl RaftNodeServer {
                             }
 
                             info!("leadership.transfer.begin");
-                            // pick a new node at random
-                            if let Some(node) = self.select_random_node().await {
+                            if let Some(node) = self.select_synced_node().await {
                                 // Transfer leadership in the background.
                                 tokio::spawn(async move {
                                     node::transfer_leadership(node).await;
@@ -1355,7 +1354,7 @@ impl RaftNodeServer {
             }
         }
 
-        // NOTE: Adding 1 to this value ensures that the number of nodes required for a quorum is more than half. 
+        // NB: Adding 1 to this value ensures that the number of nodes required for a quorum is more than half. 
         // This is important because, in case of disagreements or network splits, this ensures that any decision made is agreed upon by the majority.
         // E.G: if there are 5 voting nodes, the quorum size calculated would be (5 / 2) + 1 = 3. 
         // This means at least 3 out of 5 nodes must agree on a decision, which is a majority. Without the +1, 
@@ -1576,30 +1575,47 @@ impl RaftNodeServer {
         None
     }
 
-    // 3.10 Leadership transfer extension
-    async fn select_random_node(&self) -> Option<Arc<Node>> {
+    async fn select_synced_node(&self) -> Option<Arc<Node>> {
+        let mut retries = 10;
+        let last_log_index = self.get_last_log_index().await;
         if let Some(replicas) = self.replica_nodes.as_ref() {
             info!("node.pick");
+            // In accordance with the Leadership Transfer Extension (Section 3.10) of the Raft consensus algorithm,
+            // the process of transferring leadership involves the outgoing leader sending its log entries to the designated
+            // target server. Subsequently, the target server initiates an election without waiting for the standard
+            // election timeout to elapse.
+            // By default, the Raft protocol ensures continuous log replication across all replicas. In this context,
+            // we persistently attempt to identify the first replica where the match index aligns with the corresponding
+            // entry in the leader's log. 
+            while retries > 0 {
+                let backoff_duration = Duration::from_millis(50); 
 
-            // Obtain match indexes from all replicas and store them in a HashMap
-            let match_indexes: HashMap<String, u64> = futures::future::join_all(replicas.iter().map(|(node_id, replica)| {
-                async {
-                    let guard_replica = replica.lock().await;
-                    (node_id.clone(), guard_replica.match_index)
+                // Obtain match indexes from all replicas and store them in a HashMap
+                let match_indexes: HashMap<String, u64> = futures::future::join_all(replicas.iter().map(|(node_id, replica)| {
+                    async {
+                        let guard_replica = replica.lock().await;
+                        (node_id.clone(), guard_replica.match_index)
+                    }
+                })).await.into_iter().collect();
+
+                let mut sorted_match_indexes: Vec<(String, u64)> = match_indexes.into_iter().filter_map(|data| if data.1 == last_log_index { Some(data) } else { None }).collect();
+                // Sort the match indexes in descending order to get the highest match_index first
+                sorted_match_indexes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+                if let Some((node_id, _)) = sorted_match_indexes.first() {
+                    if let Some(node) = self.membership_configurations.find_node(node_id) {
+                        return Some(node.clone());
+                    } else {
+                        return None;
+                    }
                 }
-            })).await.into_iter().collect();
-
-            let mut sorted_match_indexes: Vec<(&String, &u64)> = match_indexes.iter().collect();
-            // Sort the match indexes in descending order to get the highest match_index first
-            sorted_match_indexes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-
-            if let Some((node_id, _)) = sorted_match_indexes.first() {
-                if let Some(node) = self.membership_configurations.find_node(node_id) {
-                    return Some(node.clone());
-                } else {
-                    return None;
-                }
+                sleep(backoff_duration).await;
+                retries -= 1;
             }
+        }
+
+        if retries == 0 {
+            error!("[ERR] unable to locate upto-date node in the cluster.")
         }
         None
     }
