@@ -79,6 +79,9 @@ impl MembershipConfigurations {
         self.comitted = current_config;
         self.commit_index = commit_index;
     }
+    pub fn find_node(&self, node_id: &str) -> Option<&Arc<Node>> {
+        self.latest.nodes.iter().find(|&n| n.id == node_id)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

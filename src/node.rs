@@ -1,7 +1,7 @@
 use std::{sync::{Arc, Mutex}, time::Duration, cmp::max};
 use log::{error, info, warn};
 use tokio::{sync::RwLock, time::sleep};
-use crate::{grpc_transport::{RaftGrpcTransport, RaftTransport}, error::RaftError, state::RaftState, raft::{LogEntry, AppendEntriesResponse}, storage::LogStore};
+use crate::{grpc_transport::{RaftGrpcTransport, RaftTransport}, error::RaftError, state::RaftState, raft::{LogEntry, AppendEntriesResponse, TimeoutNowRequest, TimeoutNowResponse}, storage::LogStore};
 use crate::raft::{
     AppendEntriesRequest, RequestVoteRequest, RequestVoteResponse
 };
@@ -55,6 +55,33 @@ pub async fn send_vote_request(
     let transport = cache.get(&node.address).unwrap();
     let locked_transport = transport.lock().unwrap();
     locked_transport.request_vote(request).await
+}
+
+
+pub async fn send_timeout_now(
+    node: &Node,
+    request: TimeoutNowRequest,
+) -> Result<TimeoutNowResponse, tonic::Status> {
+    let mut cache = TRANSPORT_CACHE.lock().await;
+
+    if !cache.contains_key(&node.address) {
+        match RaftGrpcTransport::new(node.address.as_str()).await {
+            Ok(transport) => {
+                cache.insert(node.address.clone(), Arc::new(Mutex::new(transport)));
+            },
+            Err(_) => {
+                return Err(tonic::Status::internal("Failed to create GRPC transport"));
+            }
+        }
+    }
+
+    let transport = cache.get(&node.address).unwrap();
+    let locked_transport = transport.lock().unwrap();
+    locked_transport.timeout_now(request).await
+}
+
+pub async fn transfer_leadership(node: Arc<Node>) {
+    
 }
 
 /// `ReplicaNode` represents a replica of a node within the Raft cluster.
@@ -164,9 +191,11 @@ impl ReplicaNode {
             Err(e) =>  Err(RaftError::Error(e.to_string())),
         }
     }
+
     fn update_match_index(&mut self, match_index: u64) {
         self.match_index = max(self.match_index, match_index)
     }
+
     fn update_next_index(&mut self, next_index: u64) {
         self.next_index = next_index;
     }

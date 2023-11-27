@@ -8,8 +8,9 @@ use log::info;
 use crate::error;
 
 #[derive(Debug, PartialEq)]
-pub(crate) enum ServerEventCommand {
-    Shutdown
+pub enum ServerEventCommand {
+    Shutdown,
+    StepDown,
 }
 
 /// Types of process signals.
