@@ -170,6 +170,8 @@ pub struct RaftNodeServer {
     /// Channel for sending server events.
     event_tx: tokio::sync::mpsc::UnboundedSender<ServerEventCommand>,
 
+    leadership_transfer_aftermath_cmd: Option<ServerEventCommand>,
+
     /// Channels for triggering and receiving leadership transfers.
     transfer_leadership_tx_rx: (tokio::sync::mpsc::Sender<ServerEventCommand>, tokio::sync::mpsc::Receiver<ServerEventCommand>),
 }
@@ -288,6 +290,7 @@ impl RaftNodeServer {
             rpc_rx,
             event_tx,
             raft_state,
+            leadership_transfer_aftermath_cmd: None,
         };
 
         server.setup_event_listener(event_rx);
@@ -814,7 +817,16 @@ impl RaftNodeServer {
     async fn run_follower_loop(&mut self) {
         info!("server.follower.loop");
         let mut election_timeout = self.random_election_timeout();
-    
+        
+        if self.leadership_transfer_aftermath_cmd.is_some() {
+            // restore transfer progress back to default
+            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+            self.leadership_transfer_aftermath_cmd = None;
+            // check cmd after-math of the leadership transfer
+            if let Some(ServerEventCommand::Shutdown) = &self.leadership_transfer_aftermath_cmd {
+                let _ = self.shutdown();
+            }        
+        }
         loop {
             let state = self.get_state();
             match state {
@@ -944,6 +956,7 @@ impl RaftNodeServer {
         let new_term = self.get_current_term() + 1;
         info!("total votes ({:?}) needed for election in this term {:?}", self.quorum_size(), new_term);
         
+
         self.reset_receive_heartbeat();
         self.set_current_term(new_term);
         let nodes = &self.membership_configurations.latest.nodes.clone();
@@ -1106,9 +1119,12 @@ impl RaftNodeServer {
 
         // Setup leader states
         let start_index = self.get_last_log_index().await + 1;
+       
+        self.leadership_transfer_progress.store(false, Ordering::SeqCst);
         self.set_start_index(start_index);
         self.log_entries_cache.clear();
         self.replica_nodes = None;
+        self.leadership_transfer_aftermath_cmd = None;
 
         // Establishes an immediate connection with replica nodes for the current leader and sends a heartbeat request.
         // This operation is crucial for maintaining communication with replica nodes and verifying their liveness.   
@@ -1158,7 +1174,7 @@ impl RaftNodeServer {
                                             } else {
                                                 info!("configuration change command {:?} ", command);
                                                 if self.can_modify_configuration() {
-                                                    self.append_configuration_entry(command).await;
+                                                    self.append_conf_entry(command).await;
                                                     self.establish_replica_connections().await;
                                                     response_sender.send(Ok(())).await
                                                 } else {
@@ -1276,13 +1292,27 @@ impl RaftNodeServer {
                                 info!("leadership.transfer.inprogress");
                                 continue;
                             }
-
-                            info!("leadership.transfer.begin");
-                            if let Some(node) = self.select_synced_node().await {
-                                // Transfer leadership in the background.
-                                tokio::spawn(async move {
-                                    node::transfer_leadership(node).await;
-                                });
+                            
+                            let mut leadership_transfer_success = false;
+                            // Transfer leadership with election timeout.
+                            // Once the target server receives the TimeoutNow request, it is highly likely to start an election before
+                            // any other server and become leader in the next term, and in that case we need to stop leadership transfer from happening. 
+                            let election_timeout = self.random_election_timeout();
+                            match tokio::time::timeout(election_timeout, self.handle_leadership_transfer()).await {
+                                Ok(_) => {
+                                    leadership_transfer_success = true;
+                                    info!("leadership.transfer.done <> Execution completed within the timeout.");
+                                },
+                                Err(_) => {
+                                    // revert and resume operational client request.
+                                    self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+                                    error!("[ERR] leadership.transfer.timedout.")
+                                },
+                            }
+                            
+                            if leadership_transfer_success {
+                                // We need to store this cmd here in order to act on it when the leader finally steps down later 
+                                self.leadership_transfer_aftermath_cmd = cmd
                             }
                         }        
                         _ = self.step_down.1.recv() => {
@@ -1306,6 +1336,37 @@ impl RaftNodeServer {
 
     }
 
+    async fn handle_leadership_transfer(&mut self) {
+        let leader_id = self.server_id().clone();
+        if let Some(node) = self.select_synced_node().await {
+            let node_id = node.id.clone();
+
+            info!("leadership.transfer.begin <> {}", node_id);
+
+            if let Some(replicas) = self.replica_nodes.clone() {
+                match replicas.get(&node_id) {
+                    Some(replica_node) => {
+                        let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
+                        self.leadership_transfer_progress.store(true, Ordering::SeqCst);
+                        let result = ReplicaNode::transfer_leadership(replica_node_clone, leader_id).await;
+                        if let Err(e) = result {
+                            // revert and resume operational client request.
+                            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+                            error!("
+                                [ERR] leadership.transfer.failed <> {}",
+                                e
+                            )
+                        }
+                    },
+                    None => ()
+                }
+            }
+        } else {
+            info!("
+                leadership.transfer.failed <> no available synced node"
+            );
+        }
+    }
     async fn reset_leader(&mut self) {
         self.leadership_transfer_progress.store(false, Ordering::SeqCst);
         self.log_entries_cache.clear();
@@ -1579,7 +1640,8 @@ impl RaftNodeServer {
         let mut retries = 10;
         let last_log_index = self.get_last_log_index().await;
         if let Some(replicas) = self.replica_nodes.as_ref() {
-            info!("node.pick");
+            
+            info!("node.synced.pick");
             // In accordance with the Leadership Transfer Extension (Section 3.10) of the Raft consensus algorithm,
             // the process of transferring leadership involves the outgoing leader sending its log entries to the designated
             // target server. Subsequently, the target server initiates an election without waiting for the standard
@@ -1685,7 +1747,7 @@ impl RaftNodeServer {
     /// This method creates and appends a new configuration entry
     /// to the log based on the provided configuration command. This is part of
     /// managing cluster membership changes in the Raft consensus algorithm.
-    async fn append_configuration_entry(&mut self, command: ConfigCommand) {
+    async fn append_conf_entry(&mut self, command: ConfigCommand) {
         let configuration = Configuration::new_configuration(&self.membership_configurations.latest, command);
         
         let index = self.get_last_log_index().await as u64 + 1;

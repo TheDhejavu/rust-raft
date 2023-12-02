@@ -44,9 +44,8 @@ impl FSMExecutor {
     }
     /// The main loop for the FSMExecutor.
     /// 
-    /// This asynchronous function continuously receives and processes batches of `LogEntry`.
-    /// It applies each log entry to the FSM and handles configuration updates.
-    /// The loop runs indefinitely, processing incoming log entries.
+    /// This asynchronous function continuously receives and processes batches of `LogEntry` and
+    /// it applies each log entry to the FSM and also handles configuration changes.
     pub async fn fsm_loop(&mut self) {
         info!("[FSM] fsm.loop.run");
         loop { 

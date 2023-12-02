@@ -1,6 +1,6 @@
 use std::{sync::{Arc, Mutex}, time::Duration, cmp::max};
 use log::{error, info, warn};
-use tokio::{sync::RwLock, time::sleep};
+use tokio::{sync::RwLock, time::{sleep, Instant}};
 use crate::{grpc_transport::{RaftGrpcTransport, RaftTransport}, error::RaftError, state::RaftState, raft::{LogEntry, AppendEntriesResponse, TimeoutNowRequest, TimeoutNowResponse}, storage::LogStore};
 use crate::raft::{
     AppendEntriesRequest, RequestVoteRequest, RequestVoteResponse
@@ -57,34 +57,6 @@ pub async fn send_vote_request(
     locked_transport.request_vote(request).await
 }
 
-
-pub async fn send_timeout_now(
-    node: &Node,
-    request: TimeoutNowRequest,
-) -> Result<TimeoutNowResponse, tonic::Status> {
-    let mut cache = TRANSPORT_CACHE.lock().await;
-
-    if !cache.contains_key(&node.address) {
-        match RaftGrpcTransport::new(node.address.as_str()).await {
-            Ok(transport) => {
-                cache.insert(node.address.clone(), Arc::new(Mutex::new(transport)));
-            },
-            Err(_) => {
-                return Err(tonic::Status::internal("Failed to create GRPC transport"));
-            }
-        }
-    }
-
-    let transport = cache.get(&node.address).unwrap();
-    let locked_transport = transport.lock().unwrap();
-    locked_transport.timeout_now(request).await
-}
-
-// 3.10 Leadership transfer extension
-pub async fn transfer_leadership(target_node: Arc<Node>) {
-    
-}
-
 /// `ReplicaNode` represents a replica of a node within the Raft cluster.
 ///
 /// It captures details and states associated with communication and synchronization with a remote node.
@@ -114,6 +86,10 @@ pub struct ReplicaNode {
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 
     shutdown_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<()>>>,
+
+    is_active: bool,
+
+    last_activity: Option<Instant>,
 }
 
 pub struct ReplicaNodeTxn {
@@ -135,6 +111,7 @@ impl ReplicaNode {
         match grpc_transport {
             Ok(transprt) => {
                 Ok(Self {
+                    is_active: true,
                     heartbeat_interval: Duration::from_millis(heartbeat_interval),
                     shutdown_rx: Arc::new(tokio::sync::Mutex::new(shutdown_rx)),
                     shutdown_tx,
@@ -143,6 +120,7 @@ impl ReplicaNode {
                     match_index,
                     node,
                     grpc_transport: Arc::new(transprt),
+                    last_activity: None,
                 })
             },
             Err(err) => {
@@ -163,11 +141,29 @@ impl ReplicaNode {
 
         let response = self.grpc_transport.append_entries(heartbeat_message).await;
         match response {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.update_last_activity(Instant::now());
+                Ok(())
+            },
             Err(_) => Err(RaftError::HeartbeatFailure) 
         }
     }
 
+    pub async fn send_timeout_now(
+        &mut self,
+        leader_id:  Arc<String>,
+    ) -> Result<TimeoutNowResponse, RaftError> {
+        let request = TimeoutNowRequest {
+            leader_id: leader_id.to_string(),
+        };
+
+        let response = self.grpc_transport.timeout_now(request).await;
+        match response {
+            Ok(response) =>Ok(response),
+            Err(e) =>  Err(RaftError::Error(e.to_string())),
+        }
+    }
+    
     pub async fn send_append_entries(
         &mut self, 
         leader_id:  String, 
@@ -201,10 +197,25 @@ impl ReplicaNode {
         self.next_index = next_index;
     }
 
+    fn update_last_activity(&mut self, now: Instant) {
+        self.is_active = true;
+        self.last_activity = Some(now);
+    }
+
     pub async fn stop(&mut self) {
         let result = self.shutdown_tx.send(()).await;
         if let Err(e) = result {
             error!("stop replica node channel failed: {}", e);
+        }
+    }
+
+    // 3.10 Leadership transfer extension
+    pub async fn transfer_leadership(replica_node: Arc<tokio::sync::Mutex<ReplicaNode>>, leader_id: Arc<String>) -> Result<(), RaftError> {
+        let mut replica = replica_node.lock().await;
+    
+        match replica.send_timeout_now(leader_id).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(RaftError::Error(e.to_string())),
         }
     }
     
@@ -342,6 +353,7 @@ impl ReplicaNode {
                                         // Upon successful: Update nextIndex and matchIndex for follower (§5.3).
                                         guard_replica.update_next_index(next_index);
                                         guard_replica.update_match_index(match_index);
+                                        guard_replica.update_last_activity(Instant::now());
                                     }
 
                                     info!("commit.advance.begin");
