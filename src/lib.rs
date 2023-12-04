@@ -1205,7 +1205,7 @@ impl RaftNodeServer {
         // This operation is crucial for maintaining communication with replica nodes and verifying their liveness.   
         self.establish_replica_connections().await;
 
-        // Dispatches a No_OP log entry to assert dominance as the new leader of the system.
+        // (§6.4) Dispatches a No_OP log entry to assert dominance as the new leader of the system.
         // The No_OP log serves the purpose of announcing leadership status without performing any substantive operation.
         // This operation is significant in leader election scenarios to inform other nodes of the leadership change.
         self.dispatch_no_op_log().await;
