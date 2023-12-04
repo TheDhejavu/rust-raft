@@ -155,7 +155,7 @@ async fn main() {
     }
 }
 
-const NUM_REQUESTS: usize = 100;
+const NUM_REQUESTS: usize = 10;
 
 async fn send_store_requests(leader_addr: &str) {
     let client = reqwest::Client::new();

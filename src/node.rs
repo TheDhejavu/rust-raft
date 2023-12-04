@@ -91,6 +91,7 @@ pub struct ReplicaNode {
 
     last_activity: Option<Instant>,
 }
+#[derive(Clone)]
 
 pub struct ReplicaNodeTxn {
     pub entry_replica_tx: tokio::sync::mpsc::UnboundedSender<()>,
@@ -370,7 +371,7 @@ impl ReplicaNode {
                                         Err(e) => error!("[ERR] unable to advance commit: {}", e),
                                     }
                                 } else {
-                                    warn!("replica.send.failed");
+                                    warn!("replica.send.failed: {} retries left: {} ", node_address, retries);
                                     // If AppendEntries fails due to log inconsistency:
                                     // Decrement nextIndex and retry (§5.3).
                                     if next_index > 0 {    
@@ -380,7 +381,7 @@ impl ReplicaNode {
                                 }
                             },
                             Err(err) => {
-                                error!("Failed to replicate entries to {}: {}", leader_id, err);
+                                error!("Failed to replicate entries to {}: {}", node_address, err);
                                 backoff_duration = Duration::from_millis(backoff_duration.as_millis() as u64 * 2);
                             }
                         }
@@ -390,7 +391,10 @@ impl ReplicaNode {
                         retries -= 1;
                     }
                     if retries == 0 {
-                        info!(" failed to replicate log with no retries left ==== / ");
+                        // This is where snapshot comes in, when we fail to replicate a log
+                        // then there is a probability that the node logs were too backward and we 
+                        // might need to send them a snapshot instead. 
+                        info!("Failed to replicate log with no retries left ==== / ");
                     } else {
                         info!("Completed Replication <> {} - Retries left: {}", node_address, retries);
                     }

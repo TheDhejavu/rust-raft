@@ -4,6 +4,7 @@ use std::vec;
 use config::Config;
 use configuration::{Configuration, ConfigCommand, MembershipConfigurations, ConfigStore};
 use error::RaftError;
+use std::error::Error;
 use fsm::FSM;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt; 
@@ -113,11 +114,6 @@ pub struct RaftNodeServer {
 
     /// A flag indicating whether a heartbeat has been received.
     received_heartbeat: Arc<AtomicBool>,
-
-    /// 3.10 Leadership transfer extension
-    /// A flag indicating whether that there is a leadrship transfer in progress.
-    #[allow(dead_code)]
-    leadership_transfer_progress: Arc<AtomicBool>,
     
     /// Leader-specific index from leader current term .
     start_index: Mutex<u64>,
@@ -155,7 +151,7 @@ pub struct RaftNodeServer {
     // Configuration store encapsulated for thread safety.
     config_store: Arc<tokio::sync::Mutex<ConfigStore>>,
 
-    /// Leader specific BTreeMap used for storing and efficiently processing log entries.
+    /// Leader specific BTreeMap used for caching and efficiently processing log entries.
     ///
     /// ## Requirements
     /// - Maintain order of log entries for consistency.
@@ -170,7 +166,12 @@ pub struct RaftNodeServer {
     /// Channel for sending server events.
     event_tx: tokio::sync::mpsc::UnboundedSender<ServerEventCommand>,
 
-    leadership_transfer_aftermath_cmd: Option<ServerEventCommand>,
+    /// 3.10 Leadership transfer extension
+    /// A flag indicating whether that there is a leadrship transfer in progress.
+    #[allow(dead_code)]
+    leadership_transfer_progress: Arc<AtomicBool>,
+
+    candidate_via_leadership_transfer: AtomicBool,
 
     /// Channels for triggering and receiving leadership transfers.
     transfer_leadership_tx_rx: (tokio::sync::mpsc::Sender<ServerEventCommand>, tokio::sync::mpsc::Receiver<ServerEventCommand>),
@@ -290,7 +291,7 @@ impl RaftNodeServer {
             rpc_rx,
             event_tx,
             raft_state,
-            leadership_transfer_aftermath_cmd: None,
+            candidate_via_leadership_transfer: AtomicBool::new(false),
         };
 
         server.setup_event_listener(event_rx);
@@ -305,9 +306,15 @@ impl RaftNodeServer {
     }
 
     /// Sets the current leader id
-    pub fn set_leader_id(&mut self, id: Arc<String>) {
+    pub fn set_leader_id(&mut self, id: Option<Arc<String>>) {
         let mut core = self.core.lock().unwrap();
-        core.leader_id = Some(id);
+        core.leader_id = id;
+    }
+
+    /// get the current leader id
+    pub fn get_leader_id(&mut self) -> Option<Arc<String>>{
+        let core = self.core.lock().unwrap();
+        core.leader_id.clone()
     }
     
 
@@ -395,7 +402,7 @@ impl RaftNodeServer {
     /// the internal state accordingly.
     fn become_leader(&mut self) {
         self.set_state(NodeState::Leader);
-        self.set_leader_id(self.server_id().clone());
+        self.set_leader_id(Some(self.server_id().clone()));
         info!("Node {} became the leader", self.server_id());
     }
 
@@ -438,12 +445,15 @@ impl RaftNodeServer {
         // then we should reject the request to ensure consistency. This is vital because an outdated leader shouldn't 
         // overwrite the logs of a more up-to-date node.
         if args.term < current_term {
-            error!("[LOG] The incoming term is outdated. Current local term: {}. Incoming term: {}", current_term, args.term);
+            // info!("[LOG] The incoming term is outdated. Current local term: {}. Incoming term: {}", current_term, args.term);
             return AppendEntriesResponse {
                 term: self.get_current_term(),
                 success: false,
             };
         }
+
+        // set leader id
+        self.set_leader_id(Some(Arc::new(args.leader_id)));
 
         // STEP 2: Confirm Log Consistency
         // Here we're ensuring that the logs of the follower are consistent with what the leader believes.
@@ -550,7 +560,7 @@ impl RaftNodeServer {
                         log::LogEntryType::LogConfCommand => {
                             self.process_membership_configuration_entry(entry).await;
                         },
-                        _ => {},
+                        _ => (),
                     }
                 }
 
@@ -565,26 +575,38 @@ impl RaftNodeServer {
         if args.commit_index > self.get_commit_index() {
             let index = args.commit_index.min(self.get_last_log_index().await as u64);
             self.set_commit_index(index);
-            debug!("[LOG] leader.commit_index: {}, node.commit_index: {}", args.commit_index,  self.get_commit_index());
+            // info!("[LOG] leader.commit_index: {}, node.commit_index: {}", args.commit_index,  self.get_commit_index());
+
             if index >= self.membership_configurations.commit_index {
+                info!("committment.new {} {}", index, self.membership_configurations.commit_index);
                 let latest_configuration = self.membership_configurations.latest.clone();
                 self.membership_configurations.set_comitted_configuration(latest_configuration.clone(), self.membership_configurations.index);
+                          
                 let server_id = self.server_id().to_string();
                 let mut shutdown = true;
                 for node in  self.membership_configurations.comitted.clone().nodes {
                     if node.id == server_id { shutdown = false }
                 }
                 if shutdown {
-                    // Shut down current server if node is no longer part of the configuration.
+                    // 4.1 Safety:
+                    // The configuration change is considered complete once the C_new entry is committed. 
+                    // At this stage, the leader is aware that a majority of the servers in the new configuration (C_new) have adopted it. Additionally,
+                    // the leader understands that any servers not yet transitioned to Cnew cannot collectively form a majority of the cluster. 
+                    // Servers without C_new are ineligible for leader election. The commitment of Cnew enables the following:
+                    // 1. The leader can acknowledge the successful completion of the configuration change.
+                    // 2. If the configuration change involved removing a server, that specific server can be safely shut down.
                     // This shut down will only affect followers. Leader shutdown is special.
-                    _ = self.shutdown();
+
+                    // I genuinely believe that it is absolute important to shutdown server immediately 
+                    // its removed from the config to prevent them from distrupting the cluster
+                    // TODO: this is currently not reliable and behaves wierdly.
+                    // _ = self.shutdown();
                 }
             }
             self.process_committed_logs(index, BTreeMap::new()).await;
         }
     
         self.set_current_term(args.term);
-        self.set_leader_id(Arc::new(args.leader_id));
     
         return AppendEntriesResponse {
             term: self.get_current_term(),
@@ -619,6 +641,17 @@ impl RaftNodeServer {
             self.set_current_term(args.term);
             self.become_follower();
         }
+
+        // (§4.2.3) Disruptive servers: A way of preventing distruptive servers from becoming a leader.
+        let leader_id = self.get_leader_id();
+        if !args.disrupt_leader && leader_id.is_some() && leader_id.as_deref().map_or(false, |leader_id| leader_id.to_string() != args.candidate_id) {
+            error!("vote.denied: we have a leader and you have no permission to disrupt leader");
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+        
     
         let last_index = self.logs.read().await.last_index() as u64;
         let last_entry = self.logs.read().await.get_log(last_index);
@@ -633,9 +666,10 @@ impl RaftNodeServer {
         // STEP 2: Vote Uniqueness Check
         // Each node can vote for only one candidate per term. If our node has already voted in this term,
         // it must reject any subsequent requests for votes.
-        info!("{:?} - {:?} - {:?}", self.get_voted_for().is_some() , self.get_current_term(), args.term);
+        info!("prev_voted_for: {:?} current_term: {:?} candidate_term: {:?}", self.get_voted_for() , self.get_current_term(), args.term);
         if last_voted_for.is_some() && last_vote_term == args.term {
-            error!("vote.denied: request denied because this node has already voted in the current term. Candidate's last log index: {}, Local last log index: {}. Candidate's term: {}, Local Vote term: {}.", 
+            error!("vote.denied ({}): request denied because this node has already voted in the current term. Candidate's last log index: {}, Local last log index: {}. Candidate's term: {}, Local Vote term: {}.", 
+                args.candidate_id.clone(),
                 args.last_log_index, 
                 last_index,
                 args.term,
@@ -650,7 +684,8 @@ impl RaftNodeServer {
         // STEP 3: Log Term Consistency Check
         // Ensure our log's term is not more recent than the candidate's.
         if args.last_log_term < last_term {
-            error!("vote.rejected: rejected due to invalid last log term from the candidate. Candidate's last log term: {}, Local last log term: {}.", 
+            error!("vote.rejected ({}): rejected due to invalid last log term from the candidate. Candidate's last log term: {}, Local last log term: {}.", 
+                args.candidate_id.clone(),
                 args.last_log_term, 
                 last_term
             );
@@ -677,9 +712,10 @@ impl RaftNodeServer {
         // STEP 5: Granting Vote
         // If the above conditions are satisfied, the node can grant its vote to the candidate. 
         // We then update our voted_for field to the candidate's ID and also update the vote term .
-        self.raft_state.set_voted_for(Some(args.candidate_id.into()));
+        self.raft_state.set_voted_for(Some(args.candidate_id.clone()));
         self.raft_state.set_vote_term(args.term);
 
+        info!("vote.granted <> {}", args.candidate_id.clone());
         return RequestVoteResponse {
             term: self.get_current_term(),
             vote_granted: true,
@@ -689,7 +725,8 @@ impl RaftNodeServer {
     /// According to 3.10 Leadership transfer extension , the author discuss that the prior leader sends a `TimeoutNow` request to the target server. 
     /// This request has the same effect as the target server’s election timer firing: the target server starts a new election (incrementing its term and becoming a candidate).
     async fn timeout_now(&mut self)-> TimeoutNowResponse {
-        self.reset_leader().await;
+        self.candidate_via_leadership_transfer.store(true, Ordering::SeqCst);
+        self.set_leader_id(None);
         self.become_candidate();
         TimeoutNowResponse{term: self.get_current_term(), success: true}
     }    
@@ -817,16 +854,9 @@ impl RaftNodeServer {
     async fn run_follower_loop(&mut self) {
         info!("server.follower.loop");
         let mut election_timeout = self.random_election_timeout();
-        
-        if self.leadership_transfer_aftermath_cmd.is_some() {
-            // restore transfer progress back to default
-            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
-            self.leadership_transfer_aftermath_cmd = None;
-            // check cmd after-math of the leadership transfer
-            if let Some(ServerEventCommand::Shutdown) = &self.leadership_transfer_aftermath_cmd {
-                let _ = self.shutdown();
-            }        
-        }
+        // restore transfer progress back to default
+        self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+
         loop {
             let state = self.get_state();
             match state {
@@ -901,6 +931,7 @@ impl RaftNodeServer {
                             }
                         },
                         _ = tokio::time::sleep(election_timeout) => {
+                            
                             info!("Election timed-out. do stuff");
                             let nodes = &self.membership_configurations.latest.nodes;
                             let server_id = self.server_id().to_string();
@@ -920,6 +951,9 @@ impl RaftNodeServer {
                             if !candidateship_allowed {
                                 warn!("node is unable to become candidate, {}", server_id)
                             }
+
+                            self.set_leader_id(None);
+                            election_timeout = self.random_election_timeout();
                         },
                         _ = self.transfer_leadership_tx_rx.1.recv() => {
                             warn!("NOT_A_LEADER");
@@ -956,11 +990,12 @@ impl RaftNodeServer {
         let new_term = self.get_current_term() + 1;
         info!("total votes ({:?}) needed for election in this term {:?}", self.quorum_size(), new_term);
         
-
         self.reset_receive_heartbeat();
         self.set_current_term(new_term);
+        let mut can_campaign = true;       
         let nodes = &self.membership_configurations.latest.nodes.clone();
-        loop { 
+        
+        loop {
             
             let state = self.get_state();
             match state {
@@ -975,11 +1010,12 @@ impl RaftNodeServer {
                         last_log_index: self.get_last_log_index().await, 
                         last_log_term: self.get_last_log_term().await,
                         commit_index: self.get_commit_index(), 
+                        disrupt_leader: self.candidate_via_leadership_transfer.load(Ordering::SeqCst),
                     };
-                    let begin_election = election::campaign(nodes,self.server_id(),req).await;
-                  
-                    // info!("Running as {:?}...", current_state.clone().unwrap());  
-                    if self.received_heartbeat.swap(false, Ordering::SeqCst) {
+                    let begin_election = election::campaign(nodes,self.server_id(), req, can_campaign).await;
+                    can_campaign = false;
+
+                    if self.received_heartbeat.swap(false, Ordering::SeqCst)  && !self.candidate_via_leadership_transfer.load(Ordering::SeqCst){
                         info!("Looks like there is a leader, stepping down now. {:?}", self.received_heartbeat);
                         self.become_follower();
                     }
@@ -988,6 +1024,7 @@ impl RaftNodeServer {
                         election_result = begin_election => {
                             let step_down = self.handle_vote_result(election_result, new_term).await;
                             if step_down {
+                                info!("stepping down.....");
                                 return;
                             }
                         },
@@ -1076,9 +1113,10 @@ impl RaftNodeServer {
     async fn handle_vote_result(&mut self, election_result: Vec<(String, RequestVoteResponse)> , new_term: u64)-> bool{
         let mut step_down: bool = false;
         let mut granted_votes = 0;
+        let result_count = election_result.len();
         // vote result
         for (node_id, vote_response) in election_result {
-
+            info!("vote_response: {:?}", vote_response);
             if node_id == *self.server_id() {
                 granted_votes += 1;
                 self.raft_state.set_voted_for(Some(node_id.clone()));
@@ -1105,10 +1143,14 @@ impl RaftNodeServer {
             }
         }   
 
-        info!("server.candidate.granted_votes: {:?}", granted_votes);
+        
+        if result_count > 0 {
+            info!("server.candidate.granted_votes: {:?}", granted_votes);
+        }
         if granted_votes >= self.quorum_size() {
             info!("server.election.won ");
             self.become_leader();
+            
         }
 
         step_down
@@ -1124,7 +1166,7 @@ impl RaftNodeServer {
         self.set_start_index(start_index);
         self.log_entries_cache.clear();
         self.replica_nodes = None;
-        self.leadership_transfer_aftermath_cmd = None;
+        
 
         // Establishes an immediate connection with replica nodes for the current leader and sends a heartbeat request.
         // This operation is crucial for maintaining communication with replica nodes and verifying their liveness.   
@@ -1232,6 +1274,8 @@ impl RaftNodeServer {
                                         //   - Set commitIndex = N (§5.3, §5.4).
                                         info!("quorum_index: {}, current_commit_index: {}", quorum_index , current_commit_index);
                                         if quorum_index > current_commit_index {
+                                            self.set_commit_index(quorum_index);
+                                            _ = self.process_commit_tx.send(quorum_index);
 
                                             // We need to ensure that the new configuration that we are about to commit occured
                                             // after the previous commit index and the new commit index is greater than or equal to our current committed configuration index
@@ -1247,12 +1291,12 @@ impl RaftNodeServer {
                                                     }
                                                 }
                                                 if transfer_leadership {
+                                                    info!("leadership.transfer");
                                                     _ = self.transfer_leadership_tx_rx.0.send(ServerEventCommand::Shutdown).await;
                                                 }
+
+                                                self.stop_replica_connections(&*self.membership_configurations.comitted.nodes.clone()).await;
                                             }
- 
-                                            self.set_commit_index(quorum_index);
-                                            _ = self.process_commit_tx.send(quorum_index);
                                         }
                                     }
                                     info!("committment.advance.done");
@@ -1299,20 +1343,35 @@ impl RaftNodeServer {
                             // any other server and become leader in the next term, and in that case we need to stop leadership transfer from happening. 
                             let election_timeout = self.random_election_timeout();
                             match tokio::time::timeout(election_timeout, self.handle_leadership_transfer()).await {
-                                Ok(_) => {
-                                    leadership_transfer_success = true;
-                                    info!("leadership.transfer.done <> Execution completed within the timeout.");
+                                Ok(result) => {
+                                    match result {
+                                        Ok(success) => {
+                                            if success {
+                                                leadership_transfer_success = true;
+                                                info!("leadership.transfer.success <> Execution completed within the timeout.");
+                                            }
+                                        }
+                                        Err(e) => error!(
+                                            "[ERR] leadership.transfer.failed {}", 
+                                            e,
+                                        )
+                                    }
                                 },
-                                Err(_) => {
-                                    // revert and resume operational client request.
-                                    self.leadership_transfer_progress.store(false, Ordering::SeqCst);
-                                    error!("[ERR] leadership.transfer.timedout.")
-                                },
+                                Err(e) => error!(
+                                    "[ERR] leadership.transfer.timedout {}", 
+                                    e,
+                                ),
                             }
+
+                            // revert and resume operational client request.
+                            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
                             
                             if leadership_transfer_success {
-                                // We need to store this cmd here in order to act on it when the leader finally steps down later 
-                                self.leadership_transfer_aftermath_cmd = cmd
+                               // In the worst-case scenario, if our initial assumption proves incorrect, the existing nodes within the cluster will take the initiative to elect a new leader. 
+                               // This occurs when the candidate for leadership transfer fails to emerge as the new leader or in the absence of heartbeats over an extended period.
+                                if let Some(ServerEventCommand::Shutdown) = cmd {
+                                    let _ = self.shutdown();
+                                }
                             }
                         }        
                         _ = self.step_down.1.recv() => {
@@ -1336,46 +1395,48 @@ impl RaftNodeServer {
 
     }
 
-    async fn handle_leadership_transfer(&mut self) {
+    async fn handle_leadership_transfer(&mut self) -> Result<bool, Box<dyn Error>> {
         let leader_id = self.server_id().clone();
+    
         if let Some(node) = self.select_synced_node().await {
             let node_id = node.id.clone();
-
+    
             info!("leadership.transfer.begin <> {}", node_id);
-
+    
             if let Some(replicas) = self.replica_nodes.clone() {
                 match replicas.get(&node_id) {
                     Some(replica_node) => {
                         let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
                         self.leadership_transfer_progress.store(true, Ordering::SeqCst);
                         let result = ReplicaNode::transfer_leadership(replica_node_clone, leader_id).await;
+    
                         if let Err(e) = result {
-                            // revert and resume operational client request.
-                            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
-                            error!("
-                                [ERR] leadership.transfer.failed <> {}",
-                                e
-                            )
+                            error!("[ERR] leadership.transfer.failed <> {}", e);
+                            return Err(Box::new(e));
                         }
-                    },
-                    None => ()
+                    }
+                    None => (),
                 }
             }
+    
+            Ok(true)
         } else {
-            info!("
-                leadership.transfer.failed <> no available synced node"
-            );
+            info!("leadership.transfer <> no available synced node");
+            Ok(false)
         }
     }
+    
     async fn reset_leader(&mut self) {
+        self.candidate_via_leadership_transfer.store(false, Ordering::SeqCst);
         self.leadership_transfer_progress.store(false, Ordering::SeqCst);
         self.log_entries_cache.clear();
         self.replica_nodes = None;
-        self.set_leader_id(Arc::new("".to_string()));
+        self.set_leader_id(None);
         self.stop_replica_nodes().await;
     }
 
     fn set_state(&mut self, new_state: NodeState) {
+        self.set_leader_id(None);
         let mut current_state = self.state.lock().unwrap();
         *current_state = new_state;
     }
@@ -1440,7 +1501,7 @@ impl RaftNodeServer {
             info!("nodes.previous: {:?}", previous_replica_nodes.clone().unwrap().keys());
         }
 
-        let nodes = &*self.membership_configurations.latest.nodes;
+        let nodes: &[Arc<Node>] = &*self.membership_configurations.latest.nodes;
         let replica_nodes_instance_futures = nodes.iter().map(|node| {
             let server_id = server_id.clone();
             let id = node.id.clone();
@@ -1513,7 +1574,7 @@ impl RaftNodeServer {
                     tokio::task::spawn(async move {
                         ReplicaNode::run(logs,stop_heartbeat_rx,  advance_commit_tx, raft_state, replica_node_clone, entry_replica_rx).await;
                     });
-               } 
+               }
         }
 
         if let Some(ref mut nodes_txn) = self.replica_nodes_txn  {
@@ -1522,6 +1583,8 @@ impl RaftNodeServer {
             self.replica_nodes_txn = Some(new_replica_nodes_txn);
         }
 
+    }
+    async fn stop_replica_connections(&mut self, nodes: &[Arc<Node>] ) {
         // Stop replicas that are not in the nodes list anymore
         if let Some(mut replicas) = self.replica_nodes.clone(){
             let current_node_ids: HashSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
@@ -1539,23 +1602,26 @@ impl RaftNodeServer {
                 info!("nodes.remove: {:?}", nodes_to_remove);
             }
 
-            // Remove nodes and stop them
+            // remove nodes from txns & replicas and also stop them from running.
             for node_id in nodes_to_remove {
                 if let Some(replica_node) = replicas.remove(&node_id.clone()) {
                     let mut replica = replica_node.lock().await;
                     replica.stop().await;
                 }
+                self.replica_nodes_txn.as_mut().and_then(|replica_node_txn| replica_node_txn.remove(&node_id));
             }
             self.replica_nodes = Some(replicas);
         }
     }
 
     async fn stop_replica_nodes(&mut self) {
-        for (_, node) in self.replica_nodes.as_mut().unwrap() {
-            node.lock().await.stop().await;
+        if let Some(replica_nodes) = self.replica_nodes.as_mut() {
+            for (_, node) in replica_nodes {
+                node.lock().await.stop().await;
+            }
         }
     }
-
+    
     async fn dispatch_no_op_log(&mut self) {
         let last_log_index = self.get_last_log_index().await + 1;
         let new_log = log::LogEntry {
@@ -1736,7 +1802,9 @@ impl RaftNodeServer {
             let result = self.fsm_apply_tx.send(batched_logs);
             match result {
                 Ok(_) => info!("fsm.apply.send.success"),
-                Err(e) =>  error!("fsm.apply failed to send log: {:?}", e),
+                Err(e) =>  error!("
+                    fsm.apply failed to send log: {:?}", e
+                ),
             }
         }
         self.set_last_applied(last_commit_index);
@@ -1748,13 +1816,13 @@ impl RaftNodeServer {
     /// to the log based on the provided configuration command. This is part of
     /// managing cluster membership changes in the Raft consensus algorithm.
     async fn append_conf_entry(&mut self, command: ConfigCommand) {
-        let configuration = Configuration::new_configuration(&self.membership_configurations.latest, command);
-        
+        let c_new = Configuration::new_configuration(&self.membership_configurations.latest, command);
+    
         let index = self.get_last_log_index().await as u64 + 1;
         let term =  self.get_current_term();
         let log_entry_type = log::LogEntryType::LogConfCommand;
 
-        let serialized_data_result = configuration.serialize();
+        let serialized_data_result = c_new.serialize();
         
         match serialized_data_result {
             Ok(data) => {
@@ -1766,7 +1834,7 @@ impl RaftNodeServer {
             }
         }
 
-        self.membership_configurations.set_latest_configuration(configuration, index);
+        self.membership_configurations.set_latest_configuration(c_new, index);
     }
     async fn process_membership_configuration_entry(&mut self, log: &log::LogEntry) {
         let deseralize_config_result: Result<Configuration, Box<bincode::ErrorKind>> = Configuration::deserialize(&log.data);

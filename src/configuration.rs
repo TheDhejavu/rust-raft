@@ -13,17 +13,17 @@ pub enum ConfigCommand {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct  MembershipConfigurations {
-    // represents the current configuration denoted by (C_old) which has been comitted.
+    // represents the current configuration denoted by (c_old) which has been comitted.
     pub comitted: Configuration,
 
-    /// The index for the current configuration and its relative to the committed log 
+    /// The index for the current configuration and its relative to the index of the committed configuration 
     pub commit_index: u64,
 
     // This is the log index of the new configuration and it is relative to latest 
     pub index: u64,
 
-    // Represents the new configuration denoted by (C_new) and according to Raft Paper, The new configuration takes effect on each server as soon as it is added
-    // to that server’s log: the C_new entry is replicated to the C_new servers, and a majority of the new
+    // Represents the new configuration denoted by (c_new) and according to Raft Paper, The new configuration takes effect on each server as soon as it is added
+    // to that server’s log: the c_new entry is replicated to the C_new servers, and a majority of the new
     // configuration is used to determine the C_new entry’s commitment
     pub latest: Configuration,
 }

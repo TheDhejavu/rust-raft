@@ -62,7 +62,7 @@ impl FSMExecutor {
                                         info!("[FSM] log.apply: {}", log.index);
 
                                         // What should we do here when apply fails? 
-                                        // how do we maintain consistency and ensure achieve linearizability? 
+                                        // how do we maintain consistency and ensure linearizability? 
                                         self.fsm.apply(&log).await;
                                         last_applied_index = log.index;
                                     },
@@ -70,8 +70,9 @@ impl FSMExecutor {
                                         let deseralize_config_result: Result<Configuration, Box<bincode::ErrorKind>> = Configuration::deserialize(&log.data);
                                         match deseralize_config_result {
                                             Ok(configuration) => {
-                                                info!("[FSM] configurations.persist");
+                                                info!("[FSM] configurations.persist {:?}", configuration);
                                                 _ = self.config_store.lock().await.persist(configuration, log.index);
+                                                last_applied_index = log.index;
                                             },
                                             Err(e)=> {
                                                 error!("[FSM] unable to process config entry: {:?}", e)

@@ -243,6 +243,7 @@ mod tests {
 
         let request: RequestVoteRequest = RequestVoteRequest {
             term: 1,
+            disrupt_leader: false,
             candidate_id: "aws-node-1".to_string(),
             last_log_index: 10,
             last_log_term: 1,
