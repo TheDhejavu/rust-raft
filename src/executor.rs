@@ -85,6 +85,7 @@ impl FSMExecutor {
                             if last_applied_index > 0 {
                                 info!("Logs applied up to index {}", last_applied_index);
                             }
+                            
                         },
                         None => (),
                     }

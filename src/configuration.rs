@@ -10,7 +10,6 @@ pub enum ConfigCommand {
     TransitionNode { node: Arc<Node> },
 }
 
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct  MembershipConfigurations {
     // represents the current configuration denoted by (c_old) which has been comitted.

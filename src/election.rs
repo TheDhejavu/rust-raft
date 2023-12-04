@@ -7,6 +7,12 @@ use crate::{raft::{
 }, node::{Node, NodeType, self}};
 
 
+pub enum ElectionResult {
+    Won,
+    Lost,
+    StepDown,
+}
+
 /// Initiates a campaign for a Raft node to request votes from all other nodes.
 pub async fn campaign(
     nodes: &Vec<Arc<Node>>, 

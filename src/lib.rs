@@ -16,6 +16,7 @@ use stable::StableStore;
 use storage::LogStore;
 use tokio::sync::RwLock;
 use utils::ThreadSafeBool;
+use crate::election::ElectionResult;
 use crate::executor::FSMExecutor;
 use std::{
     future::Future,
@@ -33,7 +34,7 @@ use crate::raft::{
     RequestVoteRequest, RequestVoteResponse,
 };
 
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, Instant};
 use crate::grpc_transport::{RaftTransportResponse,RaftTransportRequest};
 
 pub mod configuration;
@@ -173,6 +174,8 @@ pub struct RaftNodeServer {
 
     candidate_via_leadership_transfer: AtomicBool,
 
+    last_heartbeat_time: Option<Instant>,
+
     /// Channels for triggering and receiving leadership transfers.
     transfer_leadership_tx_rx: (tokio::sync::mpsc::Sender<ServerEventCommand>, tokio::sync::mpsc::Receiver<ServerEventCommand>),
 }
@@ -292,6 +295,7 @@ impl RaftNodeServer {
             event_tx,
             raft_state,
             candidate_via_leadership_transfer: AtomicBool::new(false),
+            last_heartbeat_time: None,
         };
 
         server.setup_event_listener(event_rx);
@@ -422,6 +426,27 @@ impl RaftNodeServer {
     fn become_follower(&mut self) {
         self.set_state(NodeState::Follower);
         info!("Node {} became the follower", self.server_id());
+    }
+
+    /// Checks for leader absence based on the configured maximum election timeout.
+    ///
+    /// If the elapsed time since the last heartbeat exceeds the maximum election timeout,
+    /// it assumes the leader is no longer available and sets the leader ID to `None`.
+    ///
+    /// Returns `true` if the leader is considered absent; otherwise, returns `false`.
+    fn check_leader_absence(&mut self) -> bool {
+        let max_election_timeout = Duration::from_secs(self.conf.election_timeout_max);
+
+        if let Some(last_heartbeat_time) = self.last_heartbeat_time {
+            let elapsed = Instant::now().duration_since(last_heartbeat_time);
+            if elapsed >= max_election_timeout {
+                // No heartbeat received within the expected timeframe.
+                // We then Assume the leader is no longer available.
+                self.set_leader_id(None);
+                return true;
+            }
+        }
+        false
     }
 
     /// Handles the appending of log entries.
@@ -607,6 +632,7 @@ impl RaftNodeServer {
         }
     
         self.set_current_term(args.term);
+        self.last_heartbeat_time = Some(Instant::now());
     
         return AppendEntriesResponse {
             term: self.get_current_term(),
@@ -632,6 +658,29 @@ impl RaftNodeServer {
             };
         }
     
+        let candidate = self.membership_configurations.find_node(&args.candidate_id);
+        if self.membership_configurations.latest.nodes.len() > 0 && candidate.is_none() {
+            error!("vote.denied: candidate is not part of latest configuration");
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+        
+
+        let leader_id = self.get_leader_id();
+        // (§4.2.3) Disruptive servers: In Raft, a leader is considered active if it is able to maintain heartbeats to its followers (otherwise, another server will
+        // start an election). Thus, servers should not be able to disrupt a leader whose cluster is receiving
+        // heartbeats. if a server receives a RequestVote request within the minimum election timeout of hearing from a current leader, it does not update its
+        // term or grant its vote. 
+        if !args.disrupt_leader && leader_id.is_some() && self.check_leader_absence(){
+            error!("vote.denied: we have a leader and you have no permission to disrupt leader");
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+
         // If the candidate's term is greater than the current term, then our node's information is outdated.
         // We need to update our term and also revert to follower state.
         if args.term > self.get_current_term() {
@@ -642,17 +691,7 @@ impl RaftNodeServer {
             self.become_follower();
         }
 
-        // (§4.2.3) Disruptive servers: A way of preventing distruptive servers from becoming a leader.
-        let leader_id = self.get_leader_id();
-        if !args.disrupt_leader && leader_id.is_some() && leader_id.as_deref().map_or(false, |leader_id| leader_id.to_string() != args.candidate_id) {
-            error!("vote.denied: we have a leader and you have no permission to disrupt leader");
-            return RequestVoteResponse {
-                term: self.get_current_term(),
-                vote_granted: false,
-            };
-        }
         
-    
         let last_index = self.logs.read().await.last_index() as u64;
         let last_entry = self.logs.read().await.get_log(last_index);
         let mut last_term= 0;
@@ -847,7 +886,6 @@ impl RaftNodeServer {
             }
         });
     }
-
     fn shutdown(&mut self) {
         _ = self.event_tx.send(ServerEventCommand::Shutdown);
     }
@@ -955,9 +993,7 @@ impl RaftNodeServer {
                             self.set_leader_id(None);
                             election_timeout = self.random_election_timeout();
                         },
-                        _ = self.transfer_leadership_tx_rx.1.recv() => {
-                            warn!("NOT_A_LEADER");
-                        }
+                        _ = self.transfer_leadership_tx_rx.1.recv() => (),
                         _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the follower loop");
                             self.set_state(NodeState::Stopped);
@@ -1022,10 +1058,13 @@ impl RaftNodeServer {
 
                     tokio::select! {
                         election_result = begin_election => {
-                            let step_down = self.handle_vote_result(election_result, new_term).await;
-                            if step_down {
-                                info!("stepping down.....");
-                                return;
+                            let result = self.handle_vote_result(election_result, new_term).await;
+                            match result {
+                                ElectionResult::Won => self.become_leader(),
+                                ElectionResult::StepDown => self.become_follower(),
+                                ElectionResult::Lost => {
+                                    info!("server.election.lost");
+                                }
                             }
                         },
                         api_message_cmd = self.api_message_rx.recv() => { 
@@ -1091,9 +1130,7 @@ impl RaftNodeServer {
                         _ = self.step_down.1.recv() => {
                             self.become_follower();
                         }
-                        _ = self.transfer_leadership_tx_rx.1.recv() => {
-                            warn!("NOT_A_LEADER");
-                        }
+                        _ = self.transfer_leadership_tx_rx.1.recv() => (),
                         _ = tokio::time::sleep(election_timeout) => {
                             info!("Election timeout reached, restarting election...");
                             return;
@@ -1110,8 +1147,7 @@ impl RaftNodeServer {
         }
     }
 
-    async fn handle_vote_result(&mut self, election_result: Vec<(String, RequestVoteResponse)> , new_term: u64)-> bool{
-        let mut step_down: bool = false;
+    async fn handle_vote_result(&mut self, election_result: Vec<(String, RequestVoteResponse)> , new_term: u64)-> election::ElectionResult {
         let mut granted_votes = 0;
         let result_count = election_result.len();
         // vote result
@@ -1132,9 +1168,7 @@ impl RaftNodeServer {
                 // set currentTerm = T, convert to follower (§5.1)
                 info!("Looks like the received term is greater than the current term, step down....");
                 self.set_current_term(vote_response.term);
-                self.become_follower();
-                step_down = true;
-                return step_down;
+                return ElectionResult::StepDown;
             }
 
             if vote_response.vote_granted {
@@ -1149,11 +1183,10 @@ impl RaftNodeServer {
         }
         if granted_votes >= self.quorum_size() {
             info!("server.election.won ");
-            self.become_leader();
-            
+            return ElectionResult::Won;
         }
 
-        step_down
+        return ElectionResult::Lost;
     }
 
     async fn run_leader_loop(&mut self) {
@@ -1358,7 +1391,7 @@ impl RaftNodeServer {
                                     }
                                 },
                                 Err(e) => error!(
-                                    "[ERR] leadership.transfer.timedout {}", 
+                                    "[ERR] leadership.transfer.timed-out {}", 
                                     e,
                                 ),
                             }
@@ -1703,7 +1736,7 @@ impl RaftNodeServer {
     }
 
     async fn select_synced_node(&self) -> Option<Arc<Node>> {
-        let mut retries = 10;
+        let mut retries = 5; 
         let last_log_index = self.get_last_log_index().await;
         if let Some(replicas) = self.replica_nodes.as_ref() {
             
