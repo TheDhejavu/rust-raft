@@ -10,15 +10,15 @@ use rust_raft::{
     RaftNodeServer, log::{LogEntry, LogEntryType},
     grpc_transport::{
         RaftTransportRequest, RaftTransportResponse, RaftGrpcTransportServer,
-    }, config::Config, node::Node, datastore::{RaftSledLogStore, RaftSledKVStore}, RaftNodeServerMessage, error::RaftError
+    }, config::Config, node::Node, datastore::{RaftSledLogStore, RaftSledKVStore}, RaftNodeServerMessage, error::RaftError, configuration, RaftCore
 };
-use tokio::time::{sleep, Duration};
+
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use clap::{App, Arg, SubCommand};
 use serde_derive::{Serialize, Deserialize};
 pub use database::MyDatabase;
-use std::{sync::Arc};
+use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use rand::Rng;
 use reqwest;
@@ -38,11 +38,11 @@ impl FSM {
     fn new(database: Arc<RwLock<MyDatabase>>) -> FSM {
         FSM { database }
     }
-}
+}   
 
 #[async_trait]
 impl rust_raft::fsm::FSM for FSM {
-    async fn apply(&self, log_entry: &LogEntry) -> Box<dyn std::any::Any> {
+    async fn apply(&mut self, log_entry: &LogEntry) -> Box<dyn std::any::Any> {
         info!("{:?}", log_entry);
 
         let log_entry_type = log_entry.log_entry_type;
@@ -58,7 +58,8 @@ impl rust_raft::fsm::FSM for FSM {
                     }
                 }
             }
-            LogEntryType::ConfCommand => {}
+            LogEntryType::LogConfCommand => {}
+            LogEntryType::LogNoOp => {}
         }
         Box::new(())
     }
@@ -100,21 +101,22 @@ async fn main() {
 
             let cfg = Config::build().server_id(server_id.to_string()).validate().unwrap();
 
-            let mut nodes: Vec<Node> = vec![];
+            let mut nodes: Vec<Arc<Node>> = vec![];
 
             for (index, address) in peer_addresses.iter().enumerate() {
-                nodes.push(Node {
-                    id: format!("peer-{}", index + 1),
+                nodes.push(Arc::new(Node {
+                    id: format!("node-aws-{}", index),
                     address: address.to_string(),
-                });
+                    node_type: rust_raft::node::NodeType::Voter,
+                }));
             }
 
-            let fsm_database = MyDatabase::new(&format!("./tmp/raft-db_{}/state_machine", server_id.to_string())).unwrap();
+            let fsm_database = MyDatabase::new(&format!("./tmp/db_{}/state_machine", server_id.to_string())).unwrap();
             let db = Arc::new(RwLock::new(fsm_database));
             let fsm: FSM = FSM::new(db.clone());
 
-            let logs = RaftSledLogStore::new(&format!("./tmp/raft-db_{}/logs", server_id.to_string())).unwrap();
-            let stable = RaftSledKVStore::new(&format!("./tmp/raft-db_{}/stable", server_id.to_string())).unwrap();
+            let logs = RaftSledLogStore::new(&format!("./tmp/db_{}/logs", server_id.to_string())).unwrap();
+            let stable = RaftSledKVStore::new(&format!("./tmp/db_{}/stable", server_id.to_string())).unwrap();
 
             let (send, recv) = mpsc::unbounded_channel::<(RaftNodeServerMessage, mpsc::Sender<Result<(), RaftError>>)>();
 
@@ -129,26 +131,18 @@ async fn main() {
                 recv,
             ).await;
 
+
             // Create the web server.
-            let server = WebServer::new(send, db);
+            let server = WebServer::new(send.clone(), db, raft_node.core.clone());
 
             // Run the server.
             let addr = format!("127.0.0.1:{}", http_port.to_string());
-            
-            // Wait for a shutdown signal (e.g., SIGTERM)
-            let shutdown_handle_listener = tokio::spawn(async move {
-                tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-                info!("Shutdown signal received, notifying all tasks to shut down...");
-                sleep(Duration::from_secs(5)).await;
-                std::process::exit(0);
-            });
-
+          
             // Start Raft node, GRPC server and API API
             _ = tokio::join!(
                 raft_node.run(),
                 grpc_server.run(server_addr),
                 server.run(&addr),
-                shutdown_handle_listener,
             )
         },
         ("store", Some(cli)) => {
@@ -161,7 +155,7 @@ async fn main() {
     }
 }
 
-const NUM_REQUESTS: usize = 100;
+const NUM_REQUESTS: usize = 10000;
 
 async fn send_store_requests(leader_addr: &str) {
     let client = reqwest::Client::new();
@@ -171,7 +165,7 @@ async fn send_store_requests(leader_addr: &str) {
         let value = generate_random_string(10);
 
         let res = client.post(&format!("{}/store", leader_addr))
-            .json(&RequestBody {
+            .json(&StoreRequestBody {
                 key: key.clone(),
                 value: value.clone(),
             })
@@ -202,35 +196,41 @@ fn generate_random_string(length: usize) -> String {
 pub struct WebServer {
     message_tx: mpsc::UnboundedSender<(RaftNodeServerMessage, mpsc::Sender<Result<(), RaftError>>)>,
     database: Arc<RwLock<MyDatabase>>,
+    raft_node_core: Arc<Mutex<RaftCore>>,
 }
 
 
 struct AppState {
     message_tx: mpsc::UnboundedSender<(RaftNodeServerMessage, mpsc::Sender<Result<(), RaftError>>)>,
     database: Arc<RwLock<MyDatabase>>,
+    raft_node_core: Arc<Mutex<RaftCore>>,
 }
 
 impl WebServer {
     pub fn new(
         message_tx: mpsc::UnboundedSender<(RaftNodeServerMessage, mpsc::Sender<Result<(), RaftError>>)>,
         database: Arc<RwLock<MyDatabase>>,
+        raft_node_core: Arc<Mutex<RaftCore>>,
     ) -> Self {
-        WebServer {message_tx, database }
+        WebServer {message_tx, database, raft_node_core }
     }
 
     pub async fn run(&self, addr: &str) -> std::io::Result<()> {
         let database = self.database.clone();
         let message_tx = self.message_tx.clone();
+        let raft_node_core = self.raft_node_core.clone();
       
         HttpServer::new(move || {
             ActixWeb::new()
                 .app_data(web::Data::new(AppState {
                     message_tx: message_tx.clone(),
                     database: database.clone(),
+                    raft_node_core: raft_node_core.clone(),
                 }))
                 .route("/inspect", web::get().to(inspect_handler))
                 .route("/store", web::post().to(store_handler))
                 .route("/delete", web::delete().to(delete_handler))
+                .route("/config", web::post().to(config_handler))
         })
         .bind(addr)?
         .run()
@@ -258,16 +258,19 @@ async fn inspect_handler(
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct RequestBody {
+struct StoreRequestBody {
     key: String,
     value: String,
 }
 async fn store_handler(
     data: web::Data<AppState>,
-    req_body: web::Json<RequestBody>,
+    req_body: web::Json<StoreRequestBody>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let raft_message_tx = &data.message_tx;
     let command = StateMachineCommand::Add { key: req_body.key.to_string(), value: req_body.value.to_string() };
+    if !data.raft_node_core.lock().unwrap().is_leader() {
+        error!("[Err] Not a leader");
+    }
 
     let data = bincode::serialize(&command)
         .map_err(|_| actix_web::error::ErrorInternalServerError("Serialization error"))?;
@@ -282,14 +285,19 @@ async fn store_handler(
     
     match rx.recv().await {
         Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
-        Some(Err(RaftError::NotLeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
+        Some(Err(RaftError::NotALeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
         _ => Ok(HttpResponse::InternalServerError().finish()),
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct DeleteRequestBody {
+    key: String,
+}
+
 async fn delete_handler(
     data: web::Data<AppState>,
-    req_body: web::Json<RequestBody>,
+    req_body: web::Json<DeleteRequestBody>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let raft_message_tx = &data.message_tx;
     let command = StateMachineCommand::Remove { key: req_body.key.to_string() };
@@ -307,7 +315,56 @@ async fn delete_handler(
 
     match rx.recv().await {
         Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
-        Some(Err(RaftError::NotLeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
+        Some(Err(RaftError::NotALeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
+        _ => Ok(HttpResponse::InternalServerError().finish()),
+    }
+}
+
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+enum ConfigAction {
+    REMOVE,
+    ADD,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ConfigRequestBody {
+    id: String,
+    action: ConfigAction,
+    address: String,
+}
+async fn config_handler(
+    data: web::Data<AppState>,
+    req_body: web::Json<ConfigRequestBody>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let raft_message_tx = &data.message_tx;
+    let command: configuration::ConfigCommand;
+
+    if req_body.action == ConfigAction::ADD {
+        command = configuration::ConfigCommand::AddNode { node: Arc::new(Node {
+            id: req_body.id.to_string(),
+            address: req_body.address.to_string(),
+            node_type: rust_raft::node::NodeType::Voter,
+        })};
+    } else {
+        command = configuration::ConfigCommand::RemoveNode { node: Arc::new(Node {
+            id: req_body.id.to_string(),
+            address: req_body.address.to_string(),
+            node_type: rust_raft::node::NodeType::Voter,
+        })};
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Result<(), RaftError>>(1);
+    
+    raft_message_tx.send((RaftNodeServerMessage::ApplyConfChange(command), tx))
+        .map_err(|e| {
+            error!("unable to apply config data: {}", e);
+            actix_web::error::ErrorInternalServerError("Internal error")
+        })?;
+
+    match rx.recv().await {
+        Some(Ok(_)) => Ok(HttpResponse::Ok().finish()),
+        Some(Err(RaftError::NotALeader)) => Ok(HttpResponse::BadRequest().json(json!({ "message": "Node is not a leader"}))),
         _ => Ok(HttpResponse::InternalServerError().finish()),
     }
 }

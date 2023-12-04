@@ -3,9 +3,9 @@ use crate::raft;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogEntryType {
     LogCommand,
-    ConfCommand,
+    LogNoOp,
+    LogConfCommand,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEntry {
     pub index: u64,
@@ -25,7 +25,8 @@ impl LogEntry {
         // Use a single byte for the log entry type
         let type_byte = match self.log_entry_type {
             LogEntryType::LogCommand => 0u8,
-            LogEntryType::ConfCommand => 1u8,
+            LogEntryType::LogConfCommand => 1u8,
+            LogEntryType::LogNoOp => 2u8,
         };
         bytes.push(type_byte);
         
@@ -47,7 +48,8 @@ impl LogEntry {
         
         let log_entry_type = match bytes[16] {
             0 => LogEntryType::LogCommand,
-            1 => LogEntryType::ConfCommand,
+            1 => LogEntryType::LogConfCommand,
+            2 => LogEntryType::LogNoOp,
             _ => return None,
         };
         
@@ -65,7 +67,8 @@ impl LogEntry {
     pub fn from_rpc_raft_log(entry: raft::LogEntry) -> Option<LogEntry> {
         let log_entry_type = match entry.log_entry_type {
             x if x == raft::LogEntryType::LogCommand as i32 => Some(LogEntryType::LogCommand),
-            x if x == raft::LogEntryType::ConfCommand as i32 => Some(LogEntryType::ConfCommand),
+            x if x == raft::LogEntryType::LogConfCommand as i32 => Some(LogEntryType::LogConfCommand),
+            x if x == raft::LogEntryType::LogNoOp as i32 => Some(LogEntryType::LogNoOp),
             _ => None,  
         };
 
@@ -85,7 +88,8 @@ impl LogEntry {
             term: self.term,
             log_entry_type: match self.log_entry_type {
                 LogEntryType::LogCommand => 0,  
-                LogEntryType::ConfCommand => 1,
+                LogEntryType::LogConfCommand => 1,
+                LogEntryType::LogNoOp => 2,
             },
             data: self.data.clone(),
         }

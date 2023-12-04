@@ -1,32 +1,51 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::vec;
 use config::Config;
+use configuration::{Configuration, ConfigCommand, MembershipConfigurations, ConfigStore};
 use error::RaftError;
+use std::error::Error;
 use fsm::FSM;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt; 
 use ::log::*;
+use raft::TimeoutNowResponse;
 use rand::Rng;
-use node::{Node, ReplicaNode};
+use node::{Node, ReplicaNode, ReplicaNodeTxn};
 use stable::StableStore;
 use storage::LogStore;
 use tokio::sync::RwLock;
+use utils::ThreadSafeBool;
+use crate::election::ElectionResult;
+use crate::executor::FSMExecutor;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll}
+};
+use futures::Stream;
+use tokio::sync::mpsc::UnboundedReceiver;
+use crate::signals::{Signals, ServerEventCommand};
+use crate::node::NodeType;
 use crate::state::{NodeState, RaftState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, BTreeMap};
 use crate::raft::{
     AppendEntriesRequest, AppendEntriesResponse,
     RequestVoteRequest, RequestVoteResponse,
 };
-use std::collections::VecDeque;
+
+use tokio::time::{Duration, sleep, Instant};
 use crate::grpc_transport::{RaftTransportResponse,RaftTransportRequest};
 
-mod configuration;
+pub mod configuration;
 pub mod storage;
 mod state;
+mod election;
 pub mod error;
 mod utils;
+mod signals;
 mod mocks;
+mod executor;
 pub mod datastore;
 pub mod config;
 pub mod log;
@@ -40,21 +59,37 @@ mod raft {
 }
 
 pub enum RaftNodeServerMessage {
-   Apply(Vec<u8>)
+   Apply(Vec<u8>),
+   ApplyConfChange(ConfigCommand),
+   TransferLeadership(ServerEventCommand),
 }
+
+
+pub struct RaftCore {
+    /// Unique identifier for the node in the Raft cluster.
+    id: Arc<String>,
+
+    /// Leader's unique identifier. If `None`, the cluster doesn't currently have a leader.
+    leader_id: Option<Arc<String>>,
+}
+
+impl RaftCore {
+    /// Return true if current node is the leader
+    pub fn is_leader(&self) -> bool {
+        let leader_id = &self.leader_id;
+        leader_id.is_some() && leader_id.clone().unwrap() == self.id
+    }
+}
+
 
 /// `RaftNodeServer` represents a node in a Raft cluster. 
 ///
 /// It encapsulates the state and behavior associated with the Raft consensus algorithm.
 pub struct RaftNodeServer {
-    /// Unique identifier for the node in the Raft cluster.
-    id: Arc<String>,
+    pub core: Arc<Mutex<RaftCore>>,
 
     /// Current state of the node (e.g., follower, candidate, or leader).
     state:  Arc<Mutex<NodeState>>,
-
-    /// Leader's unique identifier. If `None`, the cluster doesn't currently have a leader.
-    leader_id: Option<Arc<String>>,
 
     /// The state of the Raft node.
     raft_state: Arc<RaftState>,
@@ -62,14 +97,15 @@ pub struct RaftNodeServer {
     /// Configuration details for the Raft node.
     conf: Config,
 
-    /// List of all known nodes in the cluster.
-    nodes: Arc<Vec<Node>>,
+    // cluster configurations containing C_new & C_old for membership change
+    membership_configurations: MembershipConfigurations,
 
     /// Replicas of other nodes in the Raft cluster.
     replica_nodes: Option<HashMap<String, Arc<tokio::sync::Mutex<ReplicaNode>>>>,
 
-    /// State machine that the Raft algorithm operates on.
-    fsm: Box<dyn FSM>,
+    /// Communication channel between raft server and it's replica. we
+    /// notify nodes of new logs via this in a non-blocking way.
+    replica_nodes_txn: Option<HashMap<String, ReplicaNodeTxn>>,
 
     /// Log entries storage mechanism.
     logs: Arc<RwLock<Box<dyn LogStore>>>,
@@ -79,35 +115,105 @@ pub struct RaftNodeServer {
 
     /// A flag indicating whether a heartbeat has been received.
     received_heartbeat: Arc<AtomicBool>,
+    
+    /// Leader-specific index from leader current term .
+    start_index: Mutex<u64>,
+
+    /// Channel to trigger step down for the current leader.
+    step_down: (tokio::sync::mpsc::Sender<()>, tokio::sync::mpsc::Receiver<()>),
 
     /// Channel to receive incoming Raft RPCs.
     rpc_rx: tokio::sync::mpsc::Receiver<(RaftTransportRequest, tokio::sync::mpsc::Sender<RaftTransportResponse>)>,
 
     // Leader specific channel for processing commit index
-    process_commit_tx: tokio::sync::mpsc::Sender<u64>, 
-    process_commit_rx: tokio::sync::mpsc::Receiver<u64>,
+    process_commit_tx: tokio::sync::mpsc::UnboundedSender<u64>, 
+
+    /// Leader-specific channel for receiving commit index updates.
+    process_commit_rx: tokio::sync::mpsc::UnboundedReceiver<u64>,
 
     // Leader specific channel for advancing commit index 
-    advance_commit_tx: tokio::sync::mpsc::Sender<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
-    advance_commit_rx: tokio::sync::mpsc::Receiver<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+    advance_commit_tx: tokio::sync::mpsc::UnboundedSender<((String, u64), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
 
-    fsm_apply_tx: tokio::sync::mpsc::Sender<Vec<log::LogEntry>>,
-    fsm_apply_rx: tokio::sync::mpsc::Receiver<Vec<log::LogEntry>>,
- 
-    // Leader specific queue for applying log entry based on FIFO
-    inflight_entry_queue: VecDeque<log::LogEntry>,
+    /// Leader-specific channel for receiving responses to commit index advancements.
+    advance_commit_rx: tokio::sync::mpsc::UnboundedReceiver<((String, u64), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+
+    /// Channel for sending log entries to the Finite State Machine (FSM) for application.
+    fsm_apply_tx: tokio::sync::mpsc::UnboundedSender<Vec<log::LogEntry>>,
+
+    /// FSM shutdown Channel to signal stopping of the FSM executor.
+    fsm_shutdown_tx: tokio::sync::mpsc::Sender<()>,
+
+    /// Channel for notifying replicas of new entries.
+    notify: (tokio::sync::mpsc::UnboundedSender<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>, tokio::sync::mpsc::UnboundedReceiver<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>),
+    
+    /// A thread-safe boolean flag indicating whether the server is running.
+    running: ThreadSafeBool,
+
+    // Configuration store encapsulated for thread safety.
+    config_store: Arc<tokio::sync::Mutex<ConfigStore>>,
+
+    /// Leader specific BTreeMap used for caching and efficiently processing log entries.
+    ///
+    /// ## Requirements
+    /// - Maintain order of log entries for consistency.
+    /// - Efficient lookups, insertions, and deletions for committed logs.
+    log_entries_cache: BTreeMap<u64, log::LogEntry>,
 
     /// Channel interacting with the Raft Node server, this is a temporary solution. 
-    /// There should be a way to run the Raft Node server in a way that's shareable for multiple threads to call.
+    /// There should be a way to run the Raft Node server in a way that's shareable for multiple threads to call
+    /// Maybe introduce a shareable non-blocking state ?.
     api_message_rx: tokio::sync::mpsc::UnboundedReceiver<(RaftNodeServerMessage, tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
+
+    /// Channel for sending server events.
+    event_tx: tokio::sync::mpsc::UnboundedSender<ServerEventCommand>,
+
+    /// 3.10 Leadership transfer extension
+    /// A flag indicating whether that there is a leadrship transfer in progress.
+    #[allow(dead_code)]
+    leadership_transfer_progress: Arc<AtomicBool>,
+
+    candidate_via_leadership_transfer: AtomicBool,
+
+    last_heartbeat_time: Option<Instant>,
+
+    /// Channels for triggering and receiving leadership transfers.
+    transfer_leadership_tx_rx: (tokio::sync::mpsc::Sender<ServerEventCommand>, tokio::sync::mpsc::Receiver<ServerEventCommand>),
 }
+
+/// A multiplexer for Raft node server events, combining an unbounded channel (`event_rx`)
+/// and an optional signal future (`signal_fut`).
+///
+/// Implements the `Stream` trait for asynchronous event handling.
+///
+struct RaftNodeServerEventMultiplexer {
+    event_rx: UnboundedReceiver<ServerEventCommand>,
+    signal_fut: Option<Signals>,
+}
+
+impl Stream for RaftNodeServerEventMultiplexer {
+    type Item = ServerEventCommand;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = Pin::into_inner(self);
+
+        if let Some(signal_fut) = &mut this.signal_fut {
+            if let Poll::Ready(signal) = Pin::new(signal_fut).poll(cx) {
+                this.signal_fut = None;
+                return Poll::Ready(Some(Signals::map_signal(signal)));
+            }
+        }
+
+        this.event_rx.poll_recv(cx)
+    }
+}
+
 
 
 impl RaftNodeServer {
     pub async fn new(
         id: String,
         conf: Config,
-        nodes: Vec<Node>,
+        nodes: Vec<Arc<Node>>,
         fsm: Box<dyn FSM>,
         stable: Box<dyn StableStore>,
         logs: Box<dyn LogStore>,
@@ -115,9 +221,13 @@ impl RaftNodeServer {
         api_message_rx: tokio::sync::mpsc::UnboundedReceiver<(RaftNodeServerMessage, tokio::sync::mpsc::Sender<Result<(), RaftError>>)>,
     ) -> Self {
         let shutdown_tx_rx = tokio::sync::mpsc::channel::<()>(1);
-        let (advance_commit_tx, advance_commit_rx, ) = tokio::sync::mpsc::channel::<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>(1);
-        let ( process_commit_tx,  process_commit_rx, ) = tokio::sync::mpsc::channel::<u64>(1);
-        let ( fsm_apply_tx,  fsm_apply_rx, ) = tokio::sync::mpsc::channel::<Vec<log::LogEntry>>(100);
+        let transfer_leadership_tx_rx = tokio::sync::mpsc::channel::<ServerEventCommand>(1);
+        let (advance_commit_tx, advance_commit_rx, ) = tokio::sync::mpsc::unbounded_channel::<((String, u64), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>();
+        let notify= tokio::sync::mpsc::unbounded_channel::<((), tokio::sync::mpsc::Sender<Result<(), RaftError>>)>();
+        let ( process_commit_tx,  process_commit_rx, ) = tokio::sync::mpsc::unbounded_channel::<u64>();
+        let ( fsm_apply_tx,  fsm_apply_rx, ) = tokio::sync::mpsc::unbounded_channel::<Vec<log::LogEntry>>();
+        let ( fsm_shutdown_tx,  fsm_shutdown_rx, ) =tokio::sync::mpsc::channel::<()>(1);
+        let step_down = tokio::sync::mpsc::channel::<()>(1);
        
         env_logger::Builder::new()
             .filter_level(::log::LevelFilter::Info) 
@@ -125,46 +235,102 @@ impl RaftNodeServer {
             .init();
 
         let raft_state =  Arc::new(RaftState::new(stable));
+        let mut membership_configurations = MembershipConfigurations::new(
+            Configuration::new(nodes.clone()),
+            0,
+            0,
+            Configuration::new(nodes.clone())
+        );
 
+        let config_store = Arc::new(tokio::sync::Mutex::new(ConfigStore::new(format!("./conf/{}/conf.bin", id))));
+        
+        // Load configuration from disk
+        match config_store.lock().await.load() {
+            Ok(config) => {
+                membership_configurations.set_comitted_configuration(config.config.clone(), config.index);
+                membership_configurations.set_latest_configuration(config.config.clone(), config.index);
+            },
+            Err(e) => error!("Unable to load persisted membership configuration: {}", e),
+        }
 
-        Self {
+        info!("raft.nodes: {:?}", membership_configurations.latest.nodes);
+
+        let clone_config_store =  config_store.clone();
+        let _handle = tokio::spawn(async move {
+            let mut fsm_executor = FSMExecutor::new(fsm_apply_rx, fsm, clone_config_store, fsm_shutdown_rx).await;
+            fsm_executor.fsm_loop().await;
+        });
+
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel::<ServerEventCommand>();
+
+        let server = Self {
             state: Arc::new(Mutex::new(NodeState::Follower)),
             conf,
-            id: Arc::new(id),
-            inflight_entry_queue: VecDeque::new(),
+            step_down,
+            notify,
+            core: Arc::new(Mutex::new(RaftCore { 
+                id: Arc::new(id),
+                leader_id: None,
+            })),
+            log_entries_cache:  BTreeMap::new(),
             advance_commit_tx,
             advance_commit_rx,
+            fsm_shutdown_tx,
+            transfer_leadership_tx_rx,
             fsm_apply_tx,
-            fsm_apply_rx,
             process_commit_rx,
             process_commit_tx,
-            leader_id: None,
+            replica_nodes_txn: None,
+            running: ThreadSafeBool::new(false),
+            config_store,
             shutdown_tx_rx,
             api_message_rx,
-            nodes: Arc::new(nodes),
+            membership_configurations,
+            start_index: Mutex::new(0),
             replica_nodes: None,
             received_heartbeat: Arc::new(AtomicBool::new(false)),
-            fsm,
+            leadership_transfer_progress: Arc::new(AtomicBool::new(false)),
             logs: Arc::new(RwLock::new(logs)),
             rpc_rx,
+            event_tx,
             raft_state,
-        }
-    }
+            candidate_via_leadership_transfer: AtomicBool::new(false),
+            last_heartbeat_time: None,
+        };
 
+        server.setup_event_listener(event_rx);
 
-    /// Return true if current node is the leader
-    pub fn is_leader(&self) -> bool {
-        self.leader_id.is_some() && self.leader_id.clone().unwrap() == self.id
+        info!("Log Index: {:?}", server.get_last_log_index().await);
+        server
     }
 
     /// Sets the current leaderid
-    pub fn set_leader_id(&mut self, leader_id: String) {
-        self.leader_id = Some(Arc::new(leader_id));
+    pub fn server_id(&self)-> Arc<String> {
+        self.core.lock().unwrap().id.clone()
     }
 
-    /// Return true if current node is the leader
-    pub fn server_id(&self) -> Arc<String> {
-        self.id.clone()
+    /// Sets the current leader id
+    pub fn set_leader_id(&mut self, id: Option<Arc<String>>) {
+        let mut core = self.core.lock().unwrap();
+        core.leader_id = id;
+    }
+
+    /// get the current leader id
+    pub fn get_leader_id(&mut self) -> Option<Arc<String>>{
+        let core = self.core.lock().unwrap();
+        core.leader_id.clone()
+    }
+    
+
+    /// Returns the start index for current node if it is a leader.
+    pub fn get_start_index(&self) -> u64 {
+        let start_index = self.start_index.lock().unwrap();
+        *start_index
+    }
+
+    pub fn set_start_index(&self, value: u64) {
+        let mut start_index = self.start_index.lock().unwrap();
+        *start_index = value;
     }
 
     /// Retrieves the current term of the node.
@@ -198,11 +364,13 @@ impl RaftNodeServer {
     }
 
     /// Retrieves the number of votes the node has received.
+    #[allow(dead_code)]
     fn get_votes(&self) -> u64 {
         self.raft_state.get_votes()
     }
 
     /// Sets the number of votes the node has received.
+    #[allow(dead_code)]
     fn set_votes(&self, value: u64) {
         self.raft_state.set_votes(value);
     }
@@ -213,6 +381,7 @@ impl RaftNodeServer {
     }
 
     /// Sets the identifier of the node that this node votes for.
+    #[allow(dead_code)]
     fn set_voted_for(&self, node_id: Option<String>) {
         self.raft_state.set_voted_for(node_id);
     }
@@ -237,7 +406,8 @@ impl RaftNodeServer {
     /// the internal state accordingly.
     fn become_leader(&mut self) {
         self.set_state(NodeState::Leader);
-        info!("Node {} became the leader", self.id);
+        self.set_leader_id(Some(self.server_id().clone()));
+        info!("Node {} became the leader", self.server_id());
     }
 
     /// Transitions the node's state to `Candidate`.
@@ -245,10 +415,8 @@ impl RaftNodeServer {
     /// When a node becomes a candidate, it will vote for itself,
     /// update the `voted_for` attribute, change its internal state
     fn become_candidate(&mut self) {
-        self.set_votes(1); // increment vote for self.
-        self.set_voted_for(Some(self.id.to_string()));
         self.set_state(NodeState::Candidate);
-        info!("Node {} became the candidate", self.id);
+        info!("Node {} became the candidate", self.server_id());
     }
 
     /// Transitions the node's state to `Follower`.
@@ -257,7 +425,28 @@ impl RaftNodeServer {
     /// update the internal state accordingly.
     fn become_follower(&mut self) {
         self.set_state(NodeState::Follower);
-        info!("Node {} became the follower", self.id);
+        info!("Node {} became the follower", self.server_id());
+    }
+
+    /// Checks for leader absence based on the configured maximum election timeout.
+    ///
+    /// If the elapsed time since the last heartbeat exceeds the maximum election timeout,
+    /// it assumes the leader is no longer available and sets the leader ID to `None`.
+    ///
+    /// Returns `true` if the leader is considered absent; otherwise, returns `false`.
+    fn check_leader_absence(&mut self) -> bool {
+        let max_election_timeout = Duration::from_secs(self.conf.election_timeout_max);
+
+        if let Some(last_heartbeat_time) = self.last_heartbeat_time {
+            let elapsed = Instant::now().duration_since(last_heartbeat_time);
+            if elapsed >= max_election_timeout {
+                // No heartbeat received within the expected timeframe.
+                // We then Assume the leader is no longer available.
+                self.set_leader_id(None);
+                return true;
+            }
+        }
+        false
     }
 
     /// Handles the appending of log entries.
@@ -281,16 +470,23 @@ impl RaftNodeServer {
         // then we should reject the request to ensure consistency. This is vital because an outdated leader shouldn't 
         // overwrite the logs of a more up-to-date node.
         if args.term < current_term {
-            error!("The incoming term is outdated. Current local term: {}. Incoming term: {}", current_term, args.term);
+            // info!("[LOG] The incoming term is outdated. Current local term: {}. Incoming term: {}", current_term, args.term);
             return AppendEntriesResponse {
                 term: self.get_current_term(),
                 success: false,
             };
         }
-    
+
+        // set leader id
+        self.set_leader_id(Some(Arc::new(args.leader_id)));
+
+        // STEP 2: Confirm Log Consistency
+        // Here we're ensuring that the logs of the follower are consistent with what the leader believes.
+        // If they're not consistent, the follower should reject the request to ensure that its logs don't 
+        // diverge from the leader's logs.
         if args.prev_log_index > 0 {
             // Fetch the server's most recent log state to determine if it's consistent with the leader's perspective.
-            let last_index = self.logs.read().await.last_index();
+            let last_index = self.get_last_log_index().await;
             let last_entry = self.logs.read().await.get_log(last_index);
             let mut last_term: u64 = 0;
             if let Ok(Some(log_entry)) = last_entry {
@@ -307,10 +503,6 @@ impl RaftNodeServer {
                 };
             }
     
-            // STEP 2: Confirm Log Consistency
-            // Here we're ensuring that the logs of the follower are consistent with what the leader believes.
-            // If they're not consistent, the follower should reject the request to ensure that its logs don't 
-            // diverge from the leader's logs.
             if args.prev_log_term != prev_log_term {
                 return AppendEntriesResponse {
                     term: self.get_current_term(),
@@ -320,34 +512,127 @@ impl RaftNodeServer {
         }
     
         if args.entries.len() > 0 {
+            info!("[LOG] New entries count: {}", args.entries.len());
             // STEP 3: Resolving Log Conflicts
             // It's possible that the follower has some log entries that conflict with what the leader is sending.
             // In Raft, logs flow from leaders to follower and they are considered to be upto-date. Thus, conflicting entries in the follower's 
             // log should be deleted and replaced with the entries from the leader.
-            // TODO: Implement this logic to remove conflicting entries.
-    
+          
+            let last_log_index = self.get_last_log_index().await;
+            let mut entries: Vec<raft::LogEntry> = vec![];
+            for (idx , entry ) in args.entries.iter().enumerate() {
+                if entry.index > last_log_index {
+                    entries.extend_from_slice(&args.entries[idx..]);
+                    // We expect entries to be store in an increasing order and we need to break out of the loop 
+                    // immediately when we discover an index that's greater than the last log index, because at this point,
+                    // we expect the set of log starting from this current index to be correct/valid enough to be stored.
+                    break
+                }
+
+                let log_result = self.logs.read().await.get_log(entry.index);
+                if let Err(e) = log_result {
+                    error!("[LOG] unable to get log {:?}", e);
+                    return AppendEntriesResponse {
+                        term: self.get_current_term(),
+                        success: false,
+                    };
+                }
+
+                // Check if the term of this log is different. if its different then it means that this log was created
+                // in a different term that was replicated by a leader that probably died prematurely.
+                if let Ok(Some(log)) = log_result {
+                    if entry.term != log.term {
+                        // Remove any conflicting logs starting from the current entry index up to the last log index. 
+                        // This is necessary because, by default, any logs subsequent to this point are considered 
+                        // conflicting due to the monotonic increase in term and log index.
+                        let delete_conflicting_log = self.logs.write().await.delete_range(entry.index, last_log_index);
+                        if let Err(e) = delete_conflicting_log {
+                            error!("[LOG] unable to delete conflicting logs {:?}", e);
+                            return AppendEntriesResponse {
+                                term: self.get_current_term(),
+                                success: false,
+                            };
+                        }
+
+                        // Check if configuration index is within the range of the conflicting logs. If YES
+                        // Revert the log back to committed configuration 
+                        if self.membership_configurations.index >= entry.index && self.membership_configurations.index <= last_log_index {
+                            // Revert changes to committed.
+                            self.membership_configurations.set_latest_configuration(
+                                self.membership_configurations.comitted.clone(), 
+                                self.membership_configurations.commit_index,
+                            )
+                        }
+                        entries.extend_from_slice(&args.entries[idx..]);
+                        break;
+                    }
+                }                
+
+            }
+
             // STEP 4: Appending New Entries
             // Once any conflicts have been resolved, we can proceed to append new entries to the log. 
             // These are the entries that the leader has but the follower does not.
-            let converted_entries: Vec<log::LogEntry> = args.entries.iter()
-                .filter_map(|entry: &raft::LogEntry| log::LogEntry::from_rpc_raft_log(entry.clone()))
-                .collect();
-            _ = self.logs.write().await.store_logs(&converted_entries[..]);
+            if entries.len() > 0 {
+                let converted_entries: Vec<log::LogEntry> = entries.iter()
+                    .filter_map(|entry: &raft::LogEntry| log::LogEntry::from_rpc_raft_log(entry.clone()))
+                    .collect();
+                _ = self.logs.write().await.store_logs(&converted_entries[..]);
+                
+                for entry in &converted_entries {
+                    info!("[LOG] log.entry: {}", entry.index);
+                    match entry.log_entry_type {
+                        log::LogEntryType::LogConfCommand => {
+                            self.process_membership_configuration_entry(entry).await;
+                        },
+                        _ => (),
+                    }
+                }
+
+                info!("[LOG] stored.entries.count {}......", converted_entries.len());
+            }
         }
     
         // STEP 5: Update Commit Index
         // The leader might have committed some entries that the follower hasn't. This step ensures that 
         // the follower updates its commit index to reflect these newly committed entries, but without 
         // going beyond the last entry it has.
-        if args.commit_index > 0 && args.commit_index > self.get_commit_index() {
+        if args.commit_index > self.get_commit_index() {
             let index = args.commit_index.min(self.get_last_log_index().await as u64);
             self.set_commit_index(index);
-            self.process_committed_logs(index, HashMap::new()).await;
+            // info!("[LOG] leader.commit_index: {}, node.commit_index: {}", args.commit_index,  self.get_commit_index());
+
+            if index >= self.membership_configurations.commit_index {
+                info!("committment.new {} {}", index, self.membership_configurations.commit_index);
+                let latest_configuration = self.membership_configurations.latest.clone();
+                self.membership_configurations.set_comitted_configuration(latest_configuration.clone(), self.membership_configurations.index);
+                          
+                let server_id = self.server_id().to_string();
+                let mut shutdown = true;
+                for node in  self.membership_configurations.comitted.clone().nodes {
+                    if node.id == server_id { shutdown = false }
+                }
+                if shutdown {
+                    // 4.1 Safety:
+                    // The configuration change is considered complete once the C_new entry is committed. 
+                    // At this stage, the leader is aware that a majority of the servers in the new configuration (C_new) have adopted it. Additionally,
+                    // the leader understands that any servers not yet transitioned to Cnew cannot collectively form a majority of the cluster. 
+                    // Servers without C_new are ineligible for leader election. The commitment of Cnew enables the following:
+                    // 1. The leader can acknowledge the successful completion of the configuration change.
+                    // 2. If the configuration change involved removing a server, that specific server can be safely shut down.
+                    // This shut down will only affect followers. Leader shutdown is special.
+
+                    // I genuinely believe that it is absolute important to shutdown server immediately 
+                    // its removed from the config to prevent them from distrupting the cluster
+                    // TODO: this is currently not reliable and behaves wierdly.
+                    // _ = self.shutdown();
+                }
+            }
+            self.process_committed_logs(index, BTreeMap::new()).await;
         }
     
-        // Synchronize the follower's perspective of the current term and leader ID with the information from the leader.
         self.set_current_term(args.term);
-        self.set_leader_id(args.leader_id);
+        self.last_heartbeat_time = Some(Instant::now());
     
         return AppendEntriesResponse {
             term: self.get_current_term(),
@@ -373,15 +658,40 @@ impl RaftNodeServer {
             };
         }
     
+        let candidate = self.membership_configurations.find_node(&args.candidate_id);
+        if self.membership_configurations.latest.nodes.len() > 0 && candidate.is_none() {
+            error!("vote.denied: candidate is not part of latest configuration");
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+        
+
+        let leader_id = self.get_leader_id();
+        // (§4.2.3) Disruptive servers: In Raft, a leader is considered active if it is able to maintain heartbeats to its followers (otherwise, another server will
+        // start an election). Thus, servers should not be able to disrupt a leader whose cluster is receiving
+        // heartbeats. if a server receives a RequestVote request within the minimum election timeout of hearing from a current leader, it does not update its
+        // term or grant its vote. 
+        if !args.disrupt_leader && leader_id.is_some() && self.check_leader_absence(){
+            error!("vote.denied: we have a leader and you have no permission to disrupt leader");
+            return RequestVoteResponse {
+                term: self.get_current_term(),
+                vote_granted: false,
+            };
+        }
+
         // If the candidate's term is greater than the current term, then our node's information is outdated.
-        // We need to update our term, revert to follower state, and reset our voted_for status to ensure we
-        // can participate in the new election round.
+        // We need to update our term and also revert to follower state.
         if args.term > self.get_current_term() {
+            // RULE:
+            // If RPC request or response contains term T > currentTerm:
+            // set currentTerm = T, convert to follower (§5.1)
             self.set_current_term(args.term);
             self.become_follower();
-            self.set_voted_for(None);
         }
-    
+
+        
         let last_index = self.logs.read().await.last_index() as u64;
         let last_entry = self.logs.read().await.get_log(last_index);
         let mut last_term= 0;
@@ -389,15 +699,20 @@ impl RaftNodeServer {
             last_term = entry.term;
         }
 
+        let last_vote_term = self.raft_state.last_vote_term();
+        let last_voted_for = self.raft_state.last_voted_for();
+
         // STEP 2: Vote Uniqueness Check
         // Each node can vote for only one candidate per term. If our node has already voted in this term,
         // it must reject any subsequent requests for votes.
-        if self.get_voted_for().is_some() && self.get_current_term() == args.term {
-            info!("Vote request denied because this node has already voted in the current term. Candidate's last log index: {}, Local last log index: {}. Candidate's term: {}, Local last term: {}.", 
+        info!("prev_voted_for: {:?} current_term: {:?} candidate_term: {:?}", self.get_voted_for() , self.get_current_term(), args.term);
+        if last_voted_for.is_some() && last_vote_term == args.term {
+            error!("vote.denied ({}): request denied because this node has already voted in the current term. Candidate's last log index: {}, Local last log index: {}. Candidate's term: {}, Local Vote term: {}.", 
+                args.candidate_id.clone(),
                 args.last_log_index, 
                 last_index,
                 args.term,
-                last_term
+                last_vote_term
             );
             return RequestVoteResponse {
                 term: self.get_current_term(),
@@ -408,7 +723,8 @@ impl RaftNodeServer {
         // STEP 3: Log Term Consistency Check
         // Ensure our log's term is not more recent than the candidate's.
         if args.last_log_term < last_term {
-            info!("Vote rejected due to invalid last log term from the candidate. Candidate's last log term: {}, Local last log term: {}.", 
+            error!("vote.rejected ({}): rejected due to invalid last log term from the candidate. Candidate's last log term: {}, Local last log term: {}.", 
+                args.candidate_id.clone(),
                 args.last_log_term, 
                 last_term
             );
@@ -422,7 +738,7 @@ impl RaftNodeServer {
         // The candidate's log must be at least as up-to-date as the log of the node it's asking a vote from.
         // This ensures that only candidates with up-to-date logs are eligible to become leaders.
         if last_term == args.last_log_term && last_index > args.last_log_index {
-            info!("Vote rejected due to outdated log term from the candidate. Candidate's last log index: {}, Local last log index: {}.", 
+            error!("vote.rejected: rejected due to outdated log index from the candidate. Candidate's last log index: {}, Local last log index: {}.", 
                 args.last_log_index, 
                 last_index
             );
@@ -431,18 +747,27 @@ impl RaftNodeServer {
                 vote_granted: false,
             };
         }
-       
 
         // STEP 5: Granting Vote
         // If the above conditions are satisfied, the node can grant its vote to the candidate. 
-        // We then update our voted_for field to the candidate's ID and synchronize our current term with the candidate's term.
-        self.set_voted_for(Some(args.candidate_id.into()));
-        self.set_current_term(args.term);
+        // We then update our voted_for field to the candidate's ID and also update the vote term .
+        self.raft_state.set_voted_for(Some(args.candidate_id.clone()));
+        self.raft_state.set_vote_term(args.term);
 
+        info!("vote.granted <> {}", args.candidate_id.clone());
         return RequestVoteResponse {
             term: self.get_current_term(),
             vote_granted: true,
         };
+    }
+
+    /// According to 3.10 Leadership transfer extension , the author discuss that the prior leader sends a `TimeoutNow` request to the target server. 
+    /// This request has the same effect as the target server’s election timer firing: the target server starts a new election (incrementing its term and becoming a candidate).
+    async fn timeout_now(&mut self)-> TimeoutNowResponse {
+        self.candidate_via_leadership_transfer.store(true, Ordering::SeqCst);
+        self.set_leader_id(None);
+        self.become_candidate();
+        TimeoutNowResponse{term: self.get_current_term(), success: true}
     }    
     /// Retrieves the current state of the node.
     ///
@@ -466,11 +791,40 @@ impl RaftNodeServer {
             }
         }
     }
-    
+
+    //=================\
+    // RAFT SERVER LOOP 
+    //=================
+    //
+    //                                   Election Timeout
+    //  Initial State                 Initiates New Election
+    //     |                                .----.
+    //     |                                |    |
+    //     v        Election Timeout        |    v      Gains Majority
+    // +-----------+   Initiates Vote  +------------+  of Votes   +---------+
+    // |  Follower |------------------>| Candidate |------------>|  Leader |
+    // +-----------+                   +------------+             +---------+
+    //     ^ ^                              |                           |
+    //     | |    Detects Leader or         |                           |
+    //     | |    Higher Term               |                           |
+    //     | '------------------------------'                           |
+    //     |                                                             |
+    //     |                       Higher Term Detected                  |
+    //     '-------------------------------------------------------------'
+    //                                   Stopped
+    //                                               (Step down, Removed, Sigterm, etc.)
+    //
     async fn start(&mut self) {
         info!("server.loop.start");
+        self.running.set(true);
+       {
+            _ = self.config_store.lock().await.persist(
+                self.membership_configurations.comitted.clone(), 
+                self.membership_configurations.commit_index,
+            );
+       }
 
-        loop {
+        while self.running.get() {
             let state = self.get_state();
             match state {
                 Ok(current_state) => {
@@ -480,19 +834,19 @@ impl RaftNodeServer {
                         Some(NodeState::Follower) => self.run_follower_loop().await,
                         Some(NodeState::Candidate) => self.run_candidate_loop().await,
                         Some(NodeState::Leader) => self.run_leader_loop().await,
+                        Some(NodeState::Stopped) => self.stop().await,
                         _ => {},
                     }
                 }
                 Err(err) => {
                     error!("server.loop.end: {:?}", err);
-                    break
+                    self.running.set(false);
                 }
             };
         }
     }
     pub async fn run(&mut self) {   
         if let Ok(Some(state)) = self.get_state() {
-            // become follower
             self.become_follower();
             info!("server.start.state: {:?}", state);
 
@@ -501,10 +855,46 @@ impl RaftNodeServer {
             error!("Failed to start raft server");
         };
     }
+    // Gracefully shutdown running background processes
+    async fn stop(&mut self) {
+        // shutdown FSM process using channel
+        _ = self.fsm_shutdown_tx.send(()).await;
+        self.running.set(false);
+        info!("server.loop.stop");
+    }
+
+    fn setup_event_listener(&self, event_rx: UnboundedReceiver<ServerEventCommand>) {
+        let mut mux = RaftNodeServerEventMultiplexer{
+            event_rx,
+            signal_fut: Some(Signals::new()),
+        };
+
+        let shutdown = self.shutdown_tx_rx.0.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = mux.next().await {
+                match cmd {
+                    ServerEventCommand::Shutdown => {
+                        _ = shutdown.send(()).await;
+                        sleep(Duration::from_secs(2)).await;
+                        break;
+                    }
+                    #[allow(unreachable_patterns)]
+                    _ => {
+                        warn!("[Unknown] command received.");
+                    }
+                }
+            }
+        });
+    }
+    fn shutdown(&mut self) {
+        _ = self.event_tx.send(ServerEventCommand::Shutdown);
+    }
     async fn run_follower_loop(&mut self) {
         info!("server.follower.loop");
         let mut election_timeout = self.random_election_timeout();
-    
+        // restore transfer progress back to default
+        self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+
         loop {
             let state = self.get_state();
             match state {
@@ -513,31 +903,42 @@ impl RaftNodeServer {
                         break;
                     }
     
-                    // info!("Running as {:?}...", current_state.clone().unwrap()); 
-    
                     tokio::select! {
-                        
-                        msg = self.api_message_rx.recv() => { 
-                            match msg {
+                        api_message_cmd = self.api_message_rx.recv() => { 
+                            match api_message_cmd {
                                 Some((request, response_sender))  => {
                                     let result = match request {
                                         RaftNodeServerMessage::Apply(_) => {
-                                            response_sender.send(Err(RaftError::NotLeader)).await
+                                            response_sender.send(Err(RaftError::NotALeader)).await
+                                        }
+                                        RaftNodeServerMessage::ApplyConfChange(_) => {
+                                            response_sender.send(Err(RaftError::NotALeader)).await
+                                        }
+                                        RaftNodeServerMessage::TransferLeadership(_) => {
+                                            response_sender.send(Err(RaftError::NotALeader)).await
                                         }
                                     };
                                     if let Err(e) = result {
-                                        error!("error handling request: {}", e);
+                                        error!("[ERR] error handling request: {}", e);
                                     }
                                 },
-                                None => {},
+                                None => (),
                             }
                         },
-                        result = self.advance_commit_rx.recv() => { 
-                            match result {
+                        notify_result = self.notify.1.recv() => {
+                            match notify_result {
                                 Some((_, response_sender))  => {
-                                    _ = response_sender.send(Err(RaftError::NotLeader)).await;
+                                    _ = response_sender.send(Err(RaftError::NotALeader)).await;
                                 },
-                                None => {},
+                                None => (),
+                            }
+                        },
+                        advance_commit_result = self.advance_commit_rx.recv() => { 
+                            match advance_commit_result {
+                                Some((_, response_sender))  => {
+                                    _ = response_sender.send(Err(RaftError::NotALeader)).await;
+                                },
+                                None => (),
                             }
                         },
                         rpc_result = self.rpc_rx.recv() => match rpc_result {
@@ -547,11 +948,15 @@ impl RaftNodeServer {
                                         self.set_receive_heartbeat();
                                         let response = self.append_entries(args).await;
                                         response_sender.send(RaftTransportResponse::AppendEntries(response)).await
-                                    },
+                                    }, 
                                     RaftTransportRequest::RequestVote(args) => {
                                         self.set_receive_heartbeat();
                                         let response = self.request_vote(args).await;
                                         response_sender.send(RaftTransportResponse::RequestVote(response)).await
+                                    },
+                                    RaftTransportRequest::TimeoutNow(_) => {
+                                        let response = self.timeout_now().await;
+                                        response_sender.send(RaftTransportResponse::TimeoutNow(response)).await
                                     },
                                 };
                                 election_timeout = self.random_election_timeout(); 
@@ -564,9 +969,31 @@ impl RaftNodeServer {
                             }
                         },
                         _ = tokio::time::sleep(election_timeout) => {
+                            
                             info!("Election timed-out. do stuff");
-                            self.become_candidate();
+                            let nodes = &self.membership_configurations.latest.nodes;
+                            let server_id = self.server_id().to_string();
+                            let mut candidateship_allowed = false;
+
+                            warn!("Nodes: {:?}", nodes);
+                            for node in nodes {
+                                // Only a Voter Node type can become a candidate
+                                warn!("Node ID: {} Type: {:?}", node.id, node.node_type);
+                                if node.id == server_id && node.node_type == NodeType::Voter {
+                                    self.become_candidate();
+                                    candidateship_allowed = true;
+                                    break
+                                }
+                            }
+
+                            if !candidateship_allowed {
+                                warn!("node is unable to become candidate, {}", server_id)
+                            }
+
+                            self.set_leader_id(None);
+                            election_timeout = self.random_election_timeout();
                         },
+                        _ = self.transfer_leadership_tx_rx.1.recv() => (),
                         _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the follower loop");
                             self.set_state(NodeState::Stopped);
@@ -574,120 +1001,136 @@ impl RaftNodeServer {
                         },
                     }
                 },
-                Err(e) => {
-                    error!("unable to unlock node state: {}", e);
-                }
+                Err(e) => error!("unable to unlock node state: {}", e)
             }
         }
     }    
     
+    /// Candidates (§5.2):
+    /// 
+    /// - On conversion to candidate, start election:
+    ///   - Increment `currentTerm`.
+    ///   - Vote for self.
+    ///   - Reset election timer.
+    ///   - Send `RequestVote` RPCs to all other servers.
+    /// 
+    /// - If votes are received from a majority of servers: become leader.
+    /// 
+    /// - If `AppendEntries` RPC received from new leader: convert to follower.
+    /// 
+    /// - If election timeout elapses: start a new election.
     async fn run_candidate_loop(&mut self) {
         info!("server.candidate.loop");
-    
-        let mut granted_votes = self.get_votes();
-        let new_term = self.get_current_term() + 1;
-        let mut can_request_vote = true;
+
         let election_timeout = self.random_election_timeout();
+        let new_term = self.get_current_term() + 1;
+        info!("total votes ({:?}) needed for election in this term {:?}", self.quorum_size(), new_term);
         
-        'outer: loop {
+        self.reset_receive_heartbeat();
+        self.set_current_term(new_term);
+        let mut can_campaign = true;       
+        let nodes = &self.membership_configurations.latest.nodes.clone();
+        
+        loop {
+            
             let state = self.get_state();
             match state {
                 Ok(current_state) => {
                     if current_state != Some(NodeState::Candidate) {
                         break;
                     }
-                    info!("Running as {:?}...", current_state.clone().unwrap()); 
-                    info!("total votes ({:?}) needed for election in this term {:?}", self.quorum_size(), new_term);
-                        
-                    if can_request_vote {
-                        self.set_current_term(new_term);
 
-                        // request for votes
-                        for node in &*self.nodes {
-                            info!("Requesting vote from {}", node.address);
-                            
-                            let req = RequestVoteRequest { 
-                                term: new_term, 
-                                candidate_id: self.id.clone().to_string(), 
-                                last_log_index: self.get_last_log_index().await, 
-                                last_log_term: self.get_last_log_term().await,
-                                commit_index: self.get_commit_index(), 
-                            };
-    
-                            let vote_result = Node::send_vote_request(&node,req).await;
-                            match vote_result {
-                                Ok(vote_response) => {
-                                    if vote_response.term > self.get_current_term() {
-                                        info!("Looks like the received term is greater than the current term, step down....");
-                                        self.set_current_term(vote_response.term);
-                                        self.become_follower();
-                                        break 'outer;
-                                    }
-    
-                                    if vote_response.vote_granted {
-                                        granted_votes += 1;
-                                        info!("peer.vote.granted: {:?}", node.id);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Unable to send vote request to {}: {}", node.address, e);
-                                }
-                            }
-                        }   
-                        can_request_vote = false;
-                    }
-    
-                    if self.received_heartbeat.swap(false, Ordering::SeqCst) {
-                        info!("Looks like there is a leader, stepping down now.");
+                    let req = RequestVoteRequest { 
+                        term: new_term, 
+                        candidate_id: self.server_id().clone().to_string(), 
+                        last_log_index: self.get_last_log_index().await, 
+                        last_log_term: self.get_last_log_term().await,
+                        commit_index: self.get_commit_index(), 
+                        disrupt_leader: self.candidate_via_leadership_transfer.load(Ordering::SeqCst),
+                    };
+                    let begin_election = election::campaign(nodes,self.server_id(), req, can_campaign).await;
+                    can_campaign = false;
+
+                    if self.received_heartbeat.swap(false, Ordering::SeqCst)  && !self.candidate_via_leadership_transfer.load(Ordering::SeqCst){
+                        info!("Looks like there is a leader, stepping down now. {:?}", self.received_heartbeat);
                         self.become_follower();
                     }
-    
-                    info!("server.candidate.granted_votes: {:?}", granted_votes);
-                    if granted_votes >= self.quorum_size() {
-                        info!("server.election.won ");
-                        self.become_leader();
-                        return;
-                    }
-    
+
                     tokio::select! {
-                        msg = self.api_message_rx.recv() => { 
-                            match msg {
+                        election_result = begin_election => {
+                            let result = self.handle_vote_result(election_result, new_term).await;
+                            match result {
+                                ElectionResult::Won => self.become_leader(),
+                                ElectionResult::StepDown => self.become_follower(),
+                                ElectionResult::Lost => {
+                                    info!("server.election.lost");
+                                }
+                            }
+                        },
+                        api_message_cmd = self.api_message_rx.recv() => { 
+                            match api_message_cmd {
                                 Some((request, response_sender))  => {
                                     _ = match request {
                                         RaftNodeServerMessage::Apply(_) => {
-                                            response_sender.send(Err(RaftError::NotLeader)).await
+                                            response_sender.send(Err(RaftError::NotALeader)).await
+                                        }
+                                        RaftNodeServerMessage::ApplyConfChange(_) => {
+                                            response_sender.send(Err(RaftError::NotALeader)).await
+                                        }
+                                        RaftNodeServerMessage::TransferLeadership(_) => {
+                                            response_sender.send(Err(RaftError::NotALeader)).await
                                         }
                                     };
                                 },
-                                None => {},
+                                None => (),
                             }
                         },
-                        result = self.advance_commit_rx.recv() => { 
-                            match result {
+                        notify_result = self.notify.1.recv() => {
+                            match notify_result {
                                 Some((_, response_sender))  => {
-                                    _ = response_sender.send(Err(RaftError::NotLeader)).await;
+                                    _ = response_sender.send(Err(RaftError::NotALeader)).await;
                                 },
-                                None => {},
+                                None => (),
+                            }
+                        },
+                        advance_commit_rx_result = self.advance_commit_rx.recv() => { 
+                            match advance_commit_rx_result {
+                                Some((_, response_sender))  => {
+                                    _ = response_sender.send(Err(RaftError::NotALeader)).await;
+                                },
+                                None => (),
                             }
                         },
                         rpc_result = self.rpc_rx.recv() => match rpc_result {
                             Some((request, response_sender)) => {
-                                _ = match request {
+                                let result = match request {
                                     RaftTransportRequest::AppendEntries(args) => {
                                         self.set_receive_heartbeat();
                                         let response = self.append_entries(args).await;
                                         response_sender.send(RaftTransportResponse::AppendEntries(response)).await
-                                    },
+                                    }, 
                                     RaftTransportRequest::RequestVote(args) => {
+                                        self.set_receive_heartbeat();
                                         let response = self.request_vote(args).await;
                                         response_sender.send(RaftTransportResponse::RequestVote(response)).await
                                     },
+                                    RaftTransportRequest::TimeoutNow(_) => {
+                                        let response = self.timeout_now().await;
+                                        response_sender.send(RaftTransportResponse::TimeoutNow(response)).await
+                                    },
                                 };
+                                if let Err(e) = result {
+                                    error!("error handling request: {}", e);
+                                }
                             },
                             None => {
                                 error!("channel was closed, restarting listener");
                             }
                         },
+                        _ = self.step_down.1.recv() => {
+                            self.become_follower();
+                        }
+                        _ = self.transfer_leadership_tx_rx.1.recv() => (),
                         _ = tokio::time::sleep(election_timeout) => {
                             info!("Election timeout reached, restarting election...");
                             return;
@@ -699,18 +1142,73 @@ impl RaftNodeServer {
                         },
                     }
                 }
-                Err(e) => {
-                    error!("unable to unlock node state: {}", e);
-                }
+                Err(e) => error!("unable to unlock node state: {}", e)
             }
         }
     }
-    
+
+    async fn handle_vote_result(&mut self, election_result: Vec<(String, RequestVoteResponse)> , new_term: u64)-> election::ElectionResult {
+        let mut granted_votes = 0;
+        let result_count = election_result.len();
+        // vote result
+        for (node_id, vote_response) in election_result {
+            info!("vote_response: {:?}", vote_response);
+            if node_id == *self.server_id() {
+                granted_votes += 1;
+                self.raft_state.set_voted_for(Some(node_id.clone()));
+                self.raft_state.set_vote_term(new_term);
+        
+                info!("self.vote.granted: {:?}", node_id);
+                continue;
+            }
+        
+            if vote_response.term > self.get_current_term() {
+                // Voting Rule According to RAFT:
+                // If RPC request or response contains term T > currentTerm:
+                // set currentTerm = T, convert to follower (§5.1)
+                info!("Looks like the received term is greater than the current term, step down....");
+                self.set_current_term(vote_response.term);
+                return ElectionResult::StepDown;
+            }
+
+            if vote_response.vote_granted {
+                granted_votes += 1;
+                info!("peer.vote.granted: {:?}", node_id);
+            }
+        }   
+
+        
+        if result_count > 0 {
+            info!("server.candidate.granted_votes: {:?}", granted_votes);
+        }
+        if granted_votes >= self.quorum_size() {
+            info!("server.election.won ");
+            return ElectionResult::Won;
+        }
+
+        return ElectionResult::Lost;
+    }
+
     async fn run_leader_loop(&mut self) {
         info!("server.leader.loop");
 
-        // immediately establish connection with replica nodes for current leader
-        self.start_replica_nodes().await;
+        // Setup leader states
+        let start_index = self.get_last_log_index().await + 1;
+       
+        self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+        self.set_start_index(start_index);
+        self.log_entries_cache.clear();
+        self.replica_nodes = None;
+        
+
+        // Establishes an immediate connection with replica nodes for the current leader and sends a heartbeat request.
+        // This operation is crucial for maintaining communication with replica nodes and verifying their liveness.   
+        self.establish_replica_connections().await;
+
+        // (§6.4) Dispatches a No_OP log entry to assert dominance as the new leader of the system.
+        // The No_OP log serves the purpose of announcing leadership status without performing any substantive operation.
+        // This operation is significant in leader election scenarios to inform other nodes of the leadership change.
+        self.dispatch_no_op_log().await;
 
         loop {
             let state = self.get_state();
@@ -719,16 +1217,55 @@ impl RaftNodeServer {
                     if current_state != Some(NodeState::Leader) {
                         break
                     }
-                    // info!("Running as {:?}...", current_state.clone().unwrap());
+                    
                     tokio::select! {
-                        cmd = self.api_message_rx.recv() => { 
-                            match cmd {
+                        api_message_cmd = self.api_message_rx.recv() => { 
+                            match api_message_cmd {
                                 Some((request, response_sender))  => {
                                     let result = match request {
                                         RaftNodeServerMessage::Apply(data) => {
-                                            info!("Handle log entry ===/ ");
-                                            _ = self.handle_log_entry(data).await;
-                                            response_sender.send(Ok(())).await
+                                            if self.leadership_transfer_progress.load(Ordering::SeqCst) {
+                                                info!("leadership.transfer.inprogress");
+                                                response_sender.send(Err(RaftError::LeadershipTransferInProgress)).await
+                                            } else {
+                                                info!("log.entry");
+
+                                                let last_log_index = self.get_last_log_index().await + 1;
+                                                let new_log = log::LogEntry {
+                                                    log_entry_type: log::LogEntryType::LogCommand,
+                                                    index: last_log_index,
+                                                    data,
+                                                    term: self.get_current_term(),
+                                                };
+
+                                                _ = self.handle_log_entry(new_log).await;
+                                                response_sender.send(Ok(())).await
+                                            }
+                                        }
+                                        RaftNodeServerMessage::ApplyConfChange(command) => {
+                                            if self.leadership_transfer_progress.load(Ordering::SeqCst) {
+                                                info!("leadership.transfer.inprogress");
+                                                response_sender.send(Err(RaftError::LeadershipTransferInProgress)).await
+                                            } else {
+                                                info!("configuration change command {:?} ", command);
+                                                if self.can_modify_configuration() {
+                                                    self.append_conf_entry(command).await;
+                                                    self.establish_replica_connections().await;
+                                                    response_sender.send(Ok(())).await
+                                                } else {
+                                                    response_sender.send(Err(RaftError::PendingConfiguration)).await
+                                                }
+                                            }
+                                        }
+                                        RaftNodeServerMessage::TransferLeadership(cmd) => {
+                                            if self.leadership_transfer_progress.load(Ordering::SeqCst) {
+                                                info!("leadership.transfer.inprogress");
+                                                response_sender.send(Err(RaftError::LeadershipTransferInProgress)).await
+                                            } else {
+                                                info!("leadership.transfer.trigger");
+                                                _ = self.transfer_leadership_tx_rx.0.send(cmd).await;
+                                                response_sender.send(Ok(())).await
+                                            }
                                         }
                                     };
 
@@ -736,80 +1273,204 @@ impl RaftNodeServer {
                                         error!("error handling request: {}", e);
                                     }
                                 },
-                                None => {},
+                                None => (),
                             }
                         },
-                        result = self.advance_commit_rx.recv() => { 
-                            match result {
+                        notify_result = self.notify.1.recv() => {
+                            match notify_result {
                                 Some((_, response_sender))  => {
-                                    info!("advance commit index ==/ ");
-                                    // Advance leader commit Index by calculating the matching indexes of the replica nodes
-                                    let current_commit_index = self.raft_state.get_commit_index();
-                                    if let Some(majority_index) = self.majority_replicated_index().await {
-                                        if majority_index > current_commit_index {
-                                            self.set_commit_index(majority_index);
-                                            _ = self.process_commit_tx.send(majority_index).await;
+                                    for (_, node) in self.replica_nodes_txn.as_mut().unwrap() {
+                                        if let Err(e) = node.entry_replica_tx.send(()) {
+                                            _ = response_sender.send(Err(RaftError::Error(e.to_string()))).await;
+                                            break;
                                         }
                                     }
                                     _ = response_sender.send(Ok(())).await;
-                                    info!("advance commit index  done ==/ ");
+                                    
                                 },
-                                None => {},
+                                None => (),
+                            }
+                        },
+                        advance_commit_result = self.advance_commit_rx.recv() => { 
+                            match advance_commit_result {
+                                Some((_, response_sender))  => {
+                                    info!("committment.advance.start");
+                                    _ = response_sender.send(Ok(())).await;
+
+                                    // Advance leader commit Index by calculating the matching indexes of the replica nodes
+                                    let current_commit_index = self.raft_state.get_commit_index();
+                                    if let Some(quorum_index) = self.compute_commit_index().await {
+                                        // If there exists an N such that:
+                                        //   - N > commitIndex.
+                                        //   - A majority of matchIndex[i] ≥ N.
+                                        //   - log[N].term == currentTerm.
+                                        //   - Set commitIndex = N (§5.3, §5.4).
+                                        info!("quorum_index: {}, current_commit_index: {}", quorum_index , current_commit_index);
+                                        if quorum_index > current_commit_index {
+                                            self.set_commit_index(quorum_index);
+                                            _ = self.process_commit_tx.send(quorum_index);
+
+                                            // We need to ensure that the new configuration that we are about to commit occured
+                                            // after the previous commit index and the new commit index is greater than or equal to our current committed configuration index
+                                            if current_commit_index <  self.membership_configurations.index && quorum_index >= self.membership_configurations.commit_index {
+                                                let latest_configuration = self.membership_configurations.latest.clone();
+                                                self.membership_configurations.set_comitted_configuration(latest_configuration, self.membership_configurations.index);
+                                                let mut transfer_leadership = true;
+                                                let server_id = self.server_id().to_string();
+                                                for node in  self.membership_configurations.comitted.clone().nodes {
+                                                    if node.id == server_id { 
+                                                        transfer_leadership = false;
+                                                        break;
+                                                    }
+                                                }
+                                                if transfer_leadership {
+                                                    info!("leadership.transfer");
+                                                    _ = self.transfer_leadership_tx_rx.0.send(ServerEventCommand::Shutdown).await;
+                                                }
+
+                                                self.stop_replica_connections(&*self.membership_configurations.comitted.nodes.clone()).await;
+                                            }
+                                        }
+                                    }
+                                    info!("committment.advance.done");
+                                },
+                                None => (),
                             }
                         },
                         _ = self.process_commit_rx.recv() => {
-                            info!("process commit  ==/ ");
+                            info!("logs.process.commit.start");
                             let commit_index = self.get_commit_index();
                             
-                            let mut inflight_logs: HashMap<u64, log::LogEntry> = HashMap::new();
+                            let mut log_entries_cache: BTreeMap<u64, log::LogEntry> = BTreeMap::new();
                             let mut last_commit_index = 0;
                         
-                            // Iterate over the inflight_entry_queue to populate inflight_logs and determine last_commit_index.
                             let mut pop_count = 0;
-                            for log_entry in &self.inflight_entry_queue {
+                            for (_, log_entry) in &self.log_entries_cache {
                                 if log_entry.index > commit_index {
                                     break;
                                 }
                         
-                                println!("Processing entry: {:?}", log_entry);
-                        
-                                inflight_logs.insert(log_entry.index, log_entry.clone());
+                                info!("Processing entry: {:?}", log_entry);
+                                log_entries_cache.insert(log_entry.index, log_entry.clone());
                                 last_commit_index = log_entry.index;
                                 pop_count += 1;
                             }
                         
-                            if !inflight_logs.is_empty() {
-                                self.process_committed_logs(last_commit_index, inflight_logs).await;
-                                
-                                // Remove the processed logs from inflight_entry_queue.
+                            if !log_entries_cache.is_empty() {
+                                self.process_committed_logs(last_commit_index, log_entries_cache).await;
                                 for _ in 0..pop_count {
-                                    self.inflight_entry_queue.pop_front();
+                                    self.log_entries_cache.pop_first();
                                 }
                             }
-                        },                        
+                            info!("logs.process.commit.end");
+                        },  
+                        cmd = self.transfer_leadership_tx_rx.1.recv() => {
+                            if self.leadership_transfer_progress.load(Ordering::SeqCst) {
+                                info!("leadership.transfer.inprogress");
+                                continue;
+                            }
+                            
+                            let mut leadership_transfer_success = false;
+                            // Transfer leadership with election timeout.
+                            // Once the target server receives the TimeoutNow request, it is highly likely to start an election before
+                            // any other server and become leader in the next term, and in that case we need to stop leadership transfer from happening. 
+                            let election_timeout = self.random_election_timeout();
+                            match tokio::time::timeout(election_timeout, self.handle_leadership_transfer()).await {
+                                Ok(result) => {
+                                    match result {
+                                        Ok(success) => {
+                                            if success {
+                                                leadership_transfer_success = true;
+                                                info!("leadership.transfer.success <> Execution completed within the timeout.");
+                                            }
+                                        }
+                                        Err(e) => error!(
+                                            "[ERR] leadership.transfer.failed {}", 
+                                            e,
+                                        )
+                                    }
+                                },
+                                Err(e) => error!(
+                                    "[ERR] leadership.transfer.timed-out {}", 
+                                    e,
+                                ),
+                            }
+
+                            // revert and resume operational client request.
+                            self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+                            
+                            if leadership_transfer_success {
+                               // In the worst-case scenario, if our initial assumption proves incorrect, the existing nodes within the cluster will take the initiative to elect a new leader. 
+                               // This occurs when the candidate for leadership transfer fails to emerge as the new leader or in the absence of heartbeats over an extended period.
+                                if let Some(ServerEventCommand::Shutdown) = cmd {
+                                    let _ = self.shutdown();
+                                }
+                            }
+                        }        
+                        _ = self.step_down.1.recv() => {
+                            self.reset_leader().await;
+                            self.become_follower();
+                        }             
                         _ = self.shutdown_tx_rx.1.recv() => { 
                             info!("Stopping the leader loop");
+
+                            // stop all replica nodes for current leader
+                            self.stop_replica_nodes().await;
                             self.set_state(NodeState::Stopped);
-                            break;
+                            return;
                         },
                         
                     }
                 },
-                Err(e) =>  {
-                    error!("unable to unlock node state: {}", e);
-                }
+                Err(e) =>  error!("unable to unlock node state: {}", e)
             }
         }
 
-        // stop all replica nodes for current leader
-       self.stop_replica_nodes().await;
+    }
+
+    async fn handle_leadership_transfer(&mut self) -> Result<bool, Box<dyn Error>> {
+        let leader_id = self.server_id().clone();
+    
+        if let Some(node) = self.select_synced_node().await {
+            let node_id = node.id.clone();
+    
+            info!("leadership.transfer.begin <> {}", node_id);
+    
+            if let Some(replicas) = self.replica_nodes.clone() {
+                match replicas.get(&node_id) {
+                    Some(replica_node) => {
+                        let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
+                        self.leadership_transfer_progress.store(true, Ordering::SeqCst);
+                        let result = ReplicaNode::transfer_leadership(replica_node_clone, leader_id).await;
+    
+                        if let Err(e) = result {
+                            error!("[ERR] leadership.transfer.failed <> {}", e);
+                            return Err(Box::new(e));
+                        }
+                    }
+                    None => (),
+                }
+            }
+    
+            Ok(true)
+        } else {
+            info!("leadership.transfer <> no available synced node");
+            Ok(false)
+        }
+    }
+    
+    async fn reset_leader(&mut self) {
+        self.candidate_via_leadership_transfer.store(false, Ordering::SeqCst);
+        self.leadership_transfer_progress.store(false, Ordering::SeqCst);
+        self.log_entries_cache.clear();
+        self.replica_nodes = None;
+        self.set_leader_id(None);
+        self.stop_replica_nodes().await;
     }
 
     fn set_state(&mut self, new_state: NodeState) {
+        self.set_leader_id(None);
         let mut current_state = self.state.lock().unwrap();
-        if new_state == NodeState::Leader {
-            self.leader_id = Some(self.id.clone());
-        }
         *current_state = new_state;
     }
 
@@ -817,33 +1478,88 @@ impl RaftNodeServer {
         self.received_heartbeat.store(true, Ordering::SeqCst);
     }
 
+    fn reset_receive_heartbeat(&mut self) {
+        self.received_heartbeat.swap(false, Ordering::SeqCst) ;
+    }
+
     fn random_election_timeout(&mut self) -> Duration {
         rand::thread_rng().gen_range(Duration::from_secs(self.conf.election_timeout_min)..Duration::from_secs(self.conf.election_timeout_max))
     }
-
-    fn quorum_size(& self) -> u64 {
-        (self.nodes.len() as u64 + 1) / 2 as u64
+    /// Checks if there is no pending configuration change and it also checks that a 
+    /// leader has committed an entry from its current term..
+    ///
+    /// This follows the guidelines discussed in the Raft consensus algorithm.
+    ///
+    /// Reference:
+    /// "Bug in single-server membership changes", a discussion in the Raft-dev Google group.
+    /// https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J)
+    ///
+    fn can_modify_configuration(&self) -> bool {
+        self.membership_configurations.index == self.membership_configurations.commit_index && self.get_commit_index() >= self.get_start_index()
     }
 
-    /// Start replica nodes based on the current nodes.
+    fn quorum_size(& self) -> u64 {
+        // TODO: If a server is known to be down or unresponsive, it should not be counted as part of the quorum during the election process.
+        // Because we need to ensure that a new leader is elected based on the availability of the majority of nodes, excluding 
+        // the unreachable or failed nodes from the decision-making process.
+        let mut qorum_size: u64 = 0;
+        for node in  self.membership_configurations.latest.nodes.iter() {
+            if node.node_type == node::NodeType::Voter {
+                qorum_size +=1
+            }
+        }
+
+        // NB: Adding 1 to this value ensures that the number of nodes required for a quorum is more than half. 
+        // This is important because, in case of disagreements or network splits, this ensures that any decision made is agreed upon by the majority.
+        // E.G: if there are 5 voting nodes, the quorum size calculated would be (5 / 2) + 1 = 3. 
+        // This means at least 3 out of 5 nodes must agree on a decision, which is a majority. Without the +1, 
+        // the quorum would be just 2 (half of 5, and this value would typically be rounded down to 2 when dealing with whole numbers),
+        //  which is not sufficient for a majority decision.
+        qorum_size  / 2  + 1
+    }
+
+    ///  Establishes an immediate connection based on the current nodes.
     ///
     /// This function attempts to create new `ReplicaNode`s for each node, 
     /// waits for their asynchronous initialization, and then stores the 
     /// successfully initialized nodes`.
-    async fn start_replica_nodes(&mut self) {
+    async fn establish_replica_connections(&mut self) {
         let current_term = self.get_current_term();
         let next_index = self.get_last_log_index().await + 1;
+        let match_index = self.get_last_log_index().await;
+        let server_id = self.server_id();
         let heartbeat_interval = self.conf.heartbeat_interval;
+        let previous_replica_nodes = self.replica_nodes.to_owned();
+        if previous_replica_nodes.is_some() {
+            info!("nodes.previous: {:?}", previous_replica_nodes.clone().unwrap().keys());
+        }
 
-        let nodes = &*self.nodes;
-        let futures = nodes.iter().map(|node| {
-            async move {
-                let id = node.id.clone();
+        let nodes: &[Arc<Node>] = &*self.membership_configurations.latest.nodes;
+        let replica_nodes_instance_futures = nodes.iter().map(|node| {
+            let server_id = server_id.clone();
+            let id = node.id.clone();
+            let mut skip= false;
+            // Check if the node already exists in previous replica nodes, If YES, skip.
+            if previous_replica_nodes.as_ref().map_or(false, |replica_nodes| replica_nodes.contains_key(&id.to_string())) {
+                skip = true;
+            }
+
+            async move { 
+                if skip { 
+                    return None;
+                }
+
+                // Ignore current raft server.
+                if server_id.to_string() == id {
+                    return None;
+                }
+
                 let result = ReplicaNode::new(
                     node.clone(),
                     current_term,
                     next_index,
                     heartbeat_interval,
+                    match_index,
                 ).await;
                 match result {
                     Ok(replica) => {
@@ -853,21 +1569,26 @@ impl RaftNodeServer {
                     Err(_) => None,
                 }
             }
-        });
+        });        
 
-        let results: Vec<_> = FuturesUnordered::from_iter(futures).collect().await;
-        let replica_map: HashMap<String, Arc<tokio::sync::Mutex<ReplicaNode>>> = results.into_iter().filter_map(|x| x).collect();
-        self.replica_nodes = Some(replica_map);
+        let results: Vec<_> = FuturesUnordered::from_iter(replica_nodes_instance_futures).collect().await;
+        let new_replica_nodes: HashMap<String, Arc<tokio::sync::Mutex<ReplicaNode>>> = results.into_iter().filter_map(|x| x).collect();
+        if let Some(ref mut replica_nodes) =  self.replica_nodes {
+            replica_nodes.extend(new_replica_nodes.clone());
+        } else {
+            self.replica_nodes = Some(new_replica_nodes.clone());
+        }
+        
+        let mut new_replica_nodes_txn: HashMap<String, ReplicaNodeTxn> = HashMap::new();
 
-        if let Some(replica_node_map) = &self.replica_nodes {
-            for (_, replica_node) in replica_node_map.iter() {
+        for (node_id, replica_node) in new_replica_nodes.iter() {
+
                let (stop_heartbeat_rx, stop_heartbeat_tx) = tokio::sync::mpsc::channel::<()>(1);
                {
                     let replica_node_clone: Arc<tokio::sync::Mutex<ReplicaNode>> = replica_node.clone();
-                    let leader_id = self.id.clone();
+                    let leader_id = self.server_id().clone();
                     let raft_state = self.raft_state.clone();
                     
-                    // spawning Replica heartbeat task
                     tokio::task::spawn(async move {
                         ReplicaNode::run_periodic_heartbeat(stop_heartbeat_tx, leader_id, raft_state, replica_node_clone).await;
                     });
@@ -879,43 +1600,84 @@ impl RaftNodeServer {
                     let logs = self.logs.clone();
                     let advance_commit_tx = self.advance_commit_tx.clone();
                     
-                    // spawning Replica task handler
+                    let (entry_replica_tx, entry_replica_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+                    let replica_node_txn = ReplicaNodeTxn{entry_replica_tx};
+                    
+                    new_replica_nodes_txn.insert(node_id.to_string(), replica_node_txn);
                     tokio::task::spawn(async move {
-                        ReplicaNode::run(logs,stop_heartbeat_rx,  advance_commit_tx, raft_state, replica_node_clone).await;
+                        ReplicaNode::run(logs,stop_heartbeat_rx,  advance_commit_tx, raft_state, replica_node_clone, entry_replica_rx).await;
                     });
                }
+        }
+
+        if let Some(ref mut nodes_txn) = self.replica_nodes_txn  {
+            nodes_txn.extend(new_replica_nodes_txn);
+        } else {
+            self.replica_nodes_txn = Some(new_replica_nodes_txn);
+        }
+
+    }
+    async fn stop_replica_connections(&mut self, nodes: &[Arc<Node>] ) {
+        // Stop replicas that are not in the nodes list anymore
+        if let Some(mut replicas) = self.replica_nodes.clone(){
+            let current_node_ids: HashSet<String> = nodes.iter().map(|node| node.id.clone()).collect();
+            
+            let mut nodes_to_remove: Vec<String> = vec![];
+
+            if let Some(replica_nodes) = &self.replica_nodes {
+                nodes_to_remove = replica_nodes
+                    .keys()
+                    .filter(|id| !current_node_ids.contains(*id))
+                    .cloned()
+                    .collect();
             }
+            if nodes_to_remove.len() > 0 {
+                info!("nodes.remove: {:?}", nodes_to_remove);
+            }
+
+            // remove nodes from txns & replicas and also stop them from running.
+            for node_id in nodes_to_remove {
+                if let Some(replica_node) = replicas.remove(&node_id.clone()) {
+                    let mut replica = replica_node.lock().await;
+                    replica.stop().await;
+                }
+                self.replica_nodes_txn.as_mut().and_then(|replica_node_txn| replica_node_txn.remove(&node_id));
+            }
+            self.replica_nodes = Some(replicas);
         }
     }
 
     async fn stop_replica_nodes(&mut self) {
-        for (_, node) in self.replica_nodes.as_mut().unwrap() {
-            node.lock().await.stop().await
-        }
-    }
-
-    async fn notify_all_replica_of_new_entry(&mut self)  {
-        for (_, node) in self.replica_nodes.as_mut().unwrap() {
-            if let Err(e) = node.lock().await.entry_replica_tx.send(()) {
-                error!("unable to notify replica of new log entry: {}", e);
+        if let Some(replica_nodes) = self.replica_nodes.as_mut() {
+            for (_, node) in replica_nodes {
+                node.lock().await.stop().await;
             }
         }
     }
-
-    async fn handle_log_entry(&mut self, data: Vec<u8>) -> Result<(), RaftError> {
-        let new_log_index = self.get_last_log_index().await + 1;
+    
+    async fn dispatch_no_op_log(&mut self) {
+        let last_log_index = self.get_last_log_index().await + 1;
         let new_log = log::LogEntry {
-            log_entry_type: log::LogEntryType::LogCommand,
-            index: new_log_index,
-            data,
+            log_entry_type: log::LogEntryType::LogNoOp,
+            index: last_log_index,
+            data: vec![],
             term: self.get_current_term(),
         };
+        _ = self.handle_log_entry(new_log).await;
+    }
+
+    async fn handle_log_entry(&mut self, mut new_log: log::LogEntry) -> Result<(), RaftError> {    
         info!("Creating new log entry: {:?}", new_log);
+
+        // Keep log up-to-date
+        let last_log_index = self.get_last_log_index().await + 1;
+        new_log.index = last_log_index;
+        new_log.term = self.get_current_term();
+
+        // Cache log for processing when committed (only applicable to the leader).
+        self.log_entries_cache.insert(new_log.index,new_log.clone());
     
-        // // Track log inflight for processing when committed (only applicable to the leader).
-        self.inflight_entry_queue.push_back(new_log.clone());
-    
-        // // Attempt to store the new log entry.
+        //Attempt to store the new log entry.
         let store_log_result = {
             let mut log_writer = self.logs.write().await;
             log_writer.store_log(&new_log)
@@ -923,30 +1685,44 @@ impl RaftNodeServer {
 
         match store_log_result {
             Ok(_) => {
-                info!("Successfully stored log entry at index {}", new_log_index);
-                self.notify_all_replica_of_new_entry().await;
+                info!("log.latest.index: {}", last_log_index);
+                let (tx, mut rx ) = tokio::sync::mpsc::channel::<Result<(), RaftError>>(1);
+                let notify = self.notify.0.send(((), tx));
+                tokio::spawn(async move {
+                    match notify {
+                        Ok(_) => {
+                            match rx.recv().await {
+                                Some(Err(e)) => error!("[ERR] notify nodes failed: {}", e),
+                                Some(Ok(_)) => info!("Notification sent successfully"),
+                                _ => ()
+                            }
+                        },
+                        Err(e) =>  error!("[ERR] Failed to send notification: {}", e)
+                    }
+                });
                 Ok(())
             }
             Err(e) => {
                 error!("Failed to store log entry: {:?}", e);
                 self.become_follower();
-                Err(RaftError::LogFailed)
+                Err(RaftError::LogEntryFailed)
             }
         }
     }
     
     /// Calculate the highest index that has been replicated on a majority of them.
-    async fn majority_replicated_index(&self) -> Option<u64> {
+    /// TODO: locking and unlocking replica nodes will cause other lock to be blocked until it is released
+    /// refactor match Indexes into a seperate modules and seperate it entirely from the replica node module
+    async fn compute_commit_index(&self) -> Option<u64> {
         if let Some(replicas) = self.replica_nodes.as_ref() {
-            info!("majority_replicated_index.block  ==/ ");
+            info!("commit_index.compute");
             // Obtain match indexes from all replicas
             let mut match_indexes: Vec<u64> = futures::future::join_all(replicas.values().map(|replica| {
                 async {
-                    let locked_replica = replica.lock().await;
-                    locked_replica.match_index
+                    let guard_replica = replica.lock().await;
+                    guard_replica.match_index
                 }
             })).await;
-            info!("majority_replicated_index.unblock  ==/ ");
             
             // Sort the match indexes
             match_indexes.sort_unstable();
@@ -959,52 +1735,149 @@ impl RaftNodeServer {
         None
     }
 
-    async fn process_committed_logs(&mut self, last_commit_index: u64, committed_logs: HashMap<u64, log::LogEntry>) {
+    async fn select_synced_node(&self) -> Option<Arc<Node>> {
+        let mut retries = 5; 
+        let last_log_index = self.get_last_log_index().await;
+        if let Some(replicas) = self.replica_nodes.as_ref() {
+            
+            info!("node.synced.pick");
+            // In accordance with the Leadership Transfer Extension (Section 3.10) of the Raft consensus algorithm,
+            // the process of transferring leadership involves the outgoing leader sending its log entries to the designated
+            // target server. Subsequently, the target server initiates an election without waiting for the standard
+            // election timeout to elapse.
+            // By default, the Raft protocol ensures continuous log replication across all replicas. In this context,
+            // we persistently attempt to identify the first replica where the match index aligns with the corresponding
+            // entry in the leader's log. 
+            while retries > 0 {
+                let backoff_duration = Duration::from_millis(50); 
+
+                // Obtain match indexes from all replicas and store them in a HashMap
+                let match_indexes: HashMap<String, u64> = futures::future::join_all(replicas.iter().map(|(node_id, replica)| {
+                    async {
+                        let guard_replica = replica.lock().await;
+                        (node_id.clone(), guard_replica.match_index)
+                    }
+                })).await.into_iter().collect();
+
+                let mut sorted_match_indexes: Vec<(String, u64)> = match_indexes.into_iter().filter_map(|data| if data.1 == last_log_index { Some(data) } else { None }).collect();
+                // Sort the match indexes in descending order to get the highest match_index first
+                sorted_match_indexes.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+
+                if let Some((node_id, _)) = sorted_match_indexes.first() {
+                    if let Some(node) = self.membership_configurations.find_node(node_id) {
+                        return Some(node.clone());
+                    } else {
+                        return None;
+                    }
+                }
+                sleep(backoff_duration).await;
+                retries -= 1;
+            }
+        }
+
+        if retries == 0 {
+            error!("[ERR] unable to locate upto-date node in the cluster.")
+        }
+        None
+    }
+    /// Processes committed log entries.
+    ///
+    /// This method applies committed logs to the state machine
+    /// based on the Raft consensus algorithm's rules. 
+    async fn process_committed_logs(&mut self, last_commit_index: u64, committed_logs: BTreeMap<u64, log::LogEntry>) {
+        // Rule:
+        // If commitIndex > lastApplied: increment lastApplied, apply
+        // log[lastApplied] to state machine (§5.3)
         let last_applied = self.get_last_applied();
-        info!("Last Applied: {}", last_applied);
-        info!("Last Commit Index: {}", last_commit_index);
+        // info!("Last Applied: {}", last_applied);
+        // info!("Last Commit Index: {}", last_commit_index);
         
         if last_commit_index <= last_applied {
-            error!("Unable to apply log because commit index <= last applied. Ignore!");
             return;
         }
     
-        let mut batched_logs = Vec::new();
+        let mut batched_logs : Vec<log::LogEntry> = Vec::new();
         for idx in (last_applied + 1)..=last_commit_index {
             match committed_logs.get(&idx) {
-                Some(log)  => {
-                    if log.index > last_applied && log.index <= last_commit_index  {
-                      batched_logs.push(log.clone());
+                Some(entry)  => {
+                    if entry.index > last_applied && entry.index <= last_commit_index  {
+                        match entry.log_entry_type {
+                            log::LogEntryType::LogCommand | log::LogEntryType::LogConfCommand => {
+                                batched_logs.push(entry.clone());
+                            },
+                            _ => (),
+                        }
                     }  else {
                         break
                     }
                 },
                 None => {
                     match self.logs.read().await.get_log(idx) {
-                        Ok(Some(entry)) => batched_logs.push(entry),
-                        Ok(None) => {
-                            error!("Empty log entry");
-                            break;  
+                        Ok(Some(entry)) => {
+                            match entry.log_entry_type {
+                                log::LogEntryType::LogCommand | log::LogEntryType::LogConfCommand => {
+                                    batched_logs.push(entry.clone());
+                                },
+                                _ => (),
+                            }
                         },
+                        Ok(None)  => break,
                         Err(e) => {
                             error!("Unable to batch log: {:?}", e);
-                            break;  
+                            break;
                         },
                     }
                 },
-                _ => {}
             }
         }
-    
-        if !batched_logs.is_empty() {
-            for log in batched_logs {
-                self.fsm.apply(&log).await;
+        
+        if batched_logs.len() > 0 {
+            let result = self.fsm_apply_tx.send(batched_logs);
+            match result {
+                Ok(_) => info!("fsm.apply.send.success"),
+                Err(e) =>  error!("
+                    fsm.apply failed to send log: {:?}", e
+                ),
             }
         }
-    
         self.set_last_applied(last_commit_index);
-        info!("Logs applied up to index {}", last_commit_index);
     }
+
+    /// Appends a new configuration entry to the log.
+    ///
+    /// This method creates and appends a new configuration entry
+    /// to the log based on the provided configuration command. This is part of
+    /// managing cluster membership changes in the Raft consensus algorithm.
+    async fn append_conf_entry(&mut self, command: ConfigCommand) {
+        let c_new = Configuration::new_configuration(&self.membership_configurations.latest, command);
     
-    
+        let index = self.get_last_log_index().await as u64 + 1;
+        let term =  self.get_current_term();
+        let log_entry_type = log::LogEntryType::LogConfCommand;
+
+        let serialized_data_result = c_new.serialize();
+        
+        match serialized_data_result {
+            Ok(data) => {
+                let log = log::LogEntry{log_entry_type, index, term, data};
+                _ = self.handle_log_entry(log).await;
+            }  
+            Err(e) => {
+                error!("Unable to serialize configuration {:?}", e);
+            }
+        }
+
+        self.membership_configurations.set_latest_configuration(c_new, index);
+    }
+    async fn process_membership_configuration_entry(&mut self, log: &log::LogEntry) {
+        let deseralize_config_result: Result<Configuration, Box<bincode::ErrorKind>> = Configuration::deserialize(&log.data);
+        match deseralize_config_result {
+            Ok(configuration) => {
+                self.membership_configurations.set_latest_configuration(configuration, log.index)
+            },
+            Err(e)=> {
+                error!("unable to process config entry: {:?}", e)
+            },
+        }   
+    }
 }

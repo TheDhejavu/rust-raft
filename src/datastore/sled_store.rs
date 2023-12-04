@@ -1,18 +1,19 @@
 use sled::{Config, Db, IVec};
 use std::convert::TryInto;
-use crate::{log::LogEntry,storage::LogStore, error::StoreError};
+use crate::{log::LogEntry, storage::LogStore, error::StoreError};
 
+/// RaftSledLogStore is a Raft log store implementation using the Sled embedded database.
 pub struct RaftSledLogStore {
     db: Db,
 }
 
 impl RaftSledLogStore {
+    /// Creates a new RaftSledLogStore instance with the specified path.
     pub fn new(path: &str) -> Result<Self, sled::Error> {
         let config = Config::new()
-        .path(path)
-        .cache_capacity(1_000_000)
-        .mode(sled::Mode::LowSpace)
-        .temporary(true);
+            .path(path)
+            .cache_capacity(1_000_000)
+            .mode(sled::Mode::LowSpace);
 
         let db = config.open()?;
         Ok(Self { db })
@@ -24,15 +25,34 @@ impl RaftSledLogStore {
 }
 
 impl LogStore for RaftSledLogStore {
+    /// Retrieves a log entry from the store based on the given index.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` - The index of the log entry to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing the log entry if found, or a StoreError if an error occurs.
     fn get_log(&self, idx: u64) -> Result<Option<LogEntry>, StoreError> {
         let key_bytes = self.key_to_bytes(idx);
         match self.db.get(&key_bytes) {
-            Ok(Some(ivec)) =>  Ok(LogEntry::from_bytes(&ivec)),
+            Ok(Some(ivec)) => Ok(LogEntry::from_bytes(&ivec)),
             Ok(None) => Ok(None),
             Err(e) => Err(StoreError::Error(e.to_string())),
         }
     }
 
+    /// Retrieves a range of log entries from the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_idx` - The minimum index of the log entries to retrieve.
+    /// * `max_idx` - The maximum index of the log entries to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// A Result containing a vector of log entries within the specified range, or a StoreError if an error occurs.
     fn get_logs_from_range(&self, min_idx: u64, max_idx: u64) -> Result<Vec<LogEntry>, StoreError> {
         let mut logs = Vec::new();
         for idx in min_idx..=max_idx {
@@ -43,37 +63,62 @@ impl LogStore for RaftSledLogStore {
                         StoreError::Error(format!("Failed to deserialize log entry at index {}", idx))
                     })?;
                     logs.push(log_entry);
-                },
-                Ok(None) => {},
+                }
+                Ok(None) => {}
                 Err(e) => return Err(StoreError::Error(e.to_string())),
             }
         }
 
         Ok(logs)
     }
-    
+
+    /// Stores a single log entry in the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `log` - The log entry to store.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or a StoreError if an error occurs.
     fn store_log(&mut self, log: &LogEntry) -> Result<(), StoreError> {
         let bytes = log.to_bytes();
         let key_bytes = self.key_to_bytes(log.index);
-        self.db.insert(key_bytes, bytes)
+        self.db
+            .insert(key_bytes, bytes)
             .map_err(|e| StoreError::InsertionError(e.to_string()))?;
+
+        self.db.flush().map_err(|e| StoreError::Error(e.to_string()))?;
         Ok(())
     }
 
+    /// Stores multiple log entries in the store as a batch operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `logs` - A slice of log entries to store.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or a StoreError if an error occurs.
     fn store_logs(&mut self, logs: &[LogEntry]) -> Result<(), StoreError> {
         let mut batch = sled::Batch::default();
-        
+
         for log in logs {
             let key_bytes = self.key_to_bytes(log.index);
             batch.insert(key_bytes, log.to_bytes());
         }
-    
-        self.db.apply_batch(batch)
+
+        self.db
+            .apply_batch(batch)
             .map_err(|e| StoreError::InsertionError(e.to_string()))?;
-    
+
+        self.db.flush().map_err(|e| StoreError::Error(e.to_string()))?;
+
         Ok(())
     }
-    
+
+    /// Retrieves the index of the first log entry in the store.
     fn first_index(&self) -> u64 {
         self.db
             .iter()
@@ -87,6 +132,7 @@ impl LogStore for RaftSledLogStore {
             .unwrap_or_default()
     }
 
+    /// Retrieves the index of the last log entry in the store.
     fn last_index(&self) -> u64 {
         self.db
             .iter()
@@ -100,11 +146,24 @@ impl LogStore for RaftSledLogStore {
             .unwrap_or_default()
     }
 
-    fn delete_range(&mut self, min_idx: u64, max_idx: u64) {
+    /// Deletes a range of log entries from the store.
+    ///
+    /// # Arguments
+    ///
+    /// * `min_idx` - The minimum index of the log entries to delete.
+    /// * `max_idx` - The maximum index of the log entries to delete.
+    ///
+    /// # Returns
+    ///
+    /// A Result indicating success or a StoreError if an error occurs.
+    fn delete_range(&mut self, min_idx: u64, max_idx: u64) -> Result<(), StoreError> {
         for idx in min_idx..=max_idx {
             let key_bytes = self.key_to_bytes(idx);
-            let _ = self.db.remove(key_bytes);
+            self.db.remove(key_bytes).map_err(|e| StoreError::Error(e.to_string()))?;
         }
+
+        self.db.flush().map_err(|e| StoreError::Error(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -195,13 +254,13 @@ mod tests {
             LogEntry {
                 index: 1,
                 term: 1,
-                log_entry_type: LogEntryType::LogCommand,
+                log_entry_type: LogEntryType::LogConfCommand,
                 data: vec![1, 2, 3, 4],
             },
             LogEntry {
                 index: 2,
                 term: 2,
-                log_entry_type: LogEntryType::ConfCommand,
+                log_entry_type: LogEntryType::LogConfCommand,
                 data: vec![5, 6, 7, 8],
             },
         ];
@@ -231,13 +290,13 @@ mod tests {
             LogEntry {
                 index: 2,
                 term: 2,
-                log_entry_type: LogEntryType::ConfCommand,
+                log_entry_type: LogEntryType::LogConfCommand,
                 data: vec![5, 6, 7, 8],
             },
         ];
 
         store.store_logs(&logs).unwrap();
-        store.delete_range(1, 1);
+        _ = store.delete_range(1, 1);
 
         assert_eq!(store.first_index(), 2);
         assert_eq!(store.last_index(), 2);

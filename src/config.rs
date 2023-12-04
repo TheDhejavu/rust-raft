@@ -6,13 +6,13 @@
 use crate::error::ConfigError;
 
 // The default value for the election timeot in illiseconds.
-const DEFAULT_ELECTION_TIMEOUT: u64 = 100;
+const DEFAULT_ELECTION_TIMEOUT: u64 = 50;
 // The minimum permissible value for the election timeout in milliseconds.
-pub const DEFAULT_ELECTION_TIMEOUT_MIN: u64 = 100;
+pub const DEFAULT_ELECTION_TIMEOUT_MIN: u64 = 50;
 // The maximum permissible value for the election timeout in milliseconds.
 pub const DEFAULT_ELECTION_TIMEOUT_MAX: u64 = 150;
 // The default interval at which heartbeats are sent, in milliseconds.
-pub const DEFAULT_HEARTBEAT_INTERVAL: u64 = 100;
+pub const DEFAULT_HEARTBEAT_INTERVAL: u64 = 10;
 // The default maximum number of entries that can be included in a single replication payload.
 pub const DEFAULT_MAX_PAYLOAD_ENTRIES: u64 = 30;
 // The default maximum number of log entries that the Raft node can store.

@@ -11,8 +11,8 @@ impl RaftSledKVStore {
         let config = Config::new()
         .path(path)
         .cache_capacity(1_000_000)
-        .mode(sled::Mode::LowSpace)
-        .temporary(true);
+        .mode(sled::Mode::LowSpace);
+        // .temporary(true);
 
         let db = config.open()?;
         Ok(Self { db })

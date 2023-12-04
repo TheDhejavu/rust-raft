@@ -9,8 +9,11 @@ pub enum RaftError {
     ConnectionRefusedError,
     UnableToUnlockNodeState,
     HeartbeatFailure,
-    LogFailed,
-    NotLeader,
+    PendingConfiguration,
+    LeadershipTransferInProgress,
+    LogEntryFailed,
+    NotALeader,
+    Error(String),
 }
 
 impl Error for RaftError {}
@@ -22,8 +25,11 @@ impl std::fmt::Display for RaftError {
             RaftError::UnableToUnlockNodeState=> write!(f, "unable to unlock node state"),
             RaftError::ConnectionRefusedError=> write!(f, "unable to connect to peer"),
             RaftError::HeartbeatFailure=> write!(f, "heartbeat failed"),
-            RaftError::LogFailed=> write!(f, "failed to handle log"),
-            RaftError::NotLeader=> write!(f, "not a leader"),
+            RaftError::LogEntryFailed=> write!(f, "failed to handle log"),
+            RaftError::NotALeader=> write!(f, "not a leader"),
+            RaftError::LeadershipTransferInProgress=> write!(f, "leadership transfer in progress"),
+            RaftError::PendingConfiguration=> write!(f, "there is a pending configuration waiting to be committed."),
+            RaftError::Error(e) =>  write!(f, "{}", e),
         }
     }
 }

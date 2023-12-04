@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, mpsc};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use crate::{raft::raft_grpc_transport_client::RaftGrpcTransportClient, utils::{format_endpoint_addr, format_server_addr}};
+use crate::{raft::{raft_grpc_transport_client::RaftGrpcTransportClient, TimeoutNowRequest, TimeoutNowResponse}, utils::{format_endpoint_addr, format_server_addr}};
 use crate::raft::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse, raft_grpc_transport_server};
 
 
@@ -13,6 +13,7 @@ use crate::raft::{AppendEntriesRequest, AppendEntriesResponse, RequestVoteReques
 pub enum RaftTransportRequest {
     AppendEntries(AppendEntriesRequest),
     RequestVote(RequestVoteRequest),
+    TimeoutNow(TimeoutNowRequest),
 }
 
 
@@ -21,6 +22,7 @@ pub enum RaftTransportRequest {
 pub enum RaftTransportResponse {
     AppendEntries(AppendEntriesResponse),
     RequestVote(RequestVoteResponse),
+    TimeoutNow(TimeoutNowResponse),
 }
 
 /// A gRPC transport layer for the Raft protocol, allowing for communication between Raft nodes.
@@ -32,6 +34,7 @@ pub struct RaftGrpcTransport {
 pub trait RaftTransport: Send + Sync{
     async fn append_entries(&self, request: AppendEntriesRequest) -> Result<AppendEntriesResponse, tonic::Status>;
     async fn request_vote(&self, request: RequestVoteRequest) -> Result<RequestVoteResponse, tonic::Status>;
+    async fn timeout_now(&self, request: TimeoutNowRequest) -> Result<TimeoutNowResponse, tonic::Status>;
 }
 
 impl RaftGrpcTransport {
@@ -58,6 +61,12 @@ impl RaftTransport for RaftGrpcTransport {
     async fn request_vote(&self, request: RequestVoteRequest) -> Result<RequestVoteResponse, tonic::Status> {
         let mut client = self.client.lock().await;
         let response = client.request_vote(request).await?;
+        Ok(response.into_inner())
+    }
+
+    async fn timeout_now(&self, request: TimeoutNowRequest) -> Result<TimeoutNowResponse, tonic::Status> {
+        let mut client = self.client.lock().await;
+        let response = client.timeout_now(request).await?;
         Ok(response.into_inner())
     }
 }
@@ -126,6 +135,22 @@ impl raft_grpc_transport_server::RaftGrpcTransport for RaftGrpcTransportServer {
             }
         }
     }
+
+    async fn timeout_now(&self, request: Request<TimeoutNowRequest>) -> Result<Response<TimeoutNowResponse>, Status> {
+        let (response_sender, mut response_receiver) = mpsc::channel(1);
+        match self.rpc_send_channel.send((RaftTransportRequest::TimeoutNow(request.into_inner()), response_sender)).await{
+            Ok(_) => {
+                match response_receiver.recv().await {
+                    Some(RaftTransportResponse::TimeoutNow(res)) => Ok(Response::new(res)),
+                    _ => Err(Status::internal("Unexpected response type"))
+                }
+            },
+            Err(e) =>  {
+                error!("Unable to process timeout now request: {}", e);
+                Err(Status::internal(format!("Unable to process timeout now  request: {}", e)))
+            }
+        }
+    }
 }
 
 
@@ -185,7 +210,7 @@ mod tests {
                 LogEntry { 
                     index: 2, 
                     term: 1, 
-                    log_entry_type: LogEntryType::ConfCommand as i32, 
+                    log_entry_type: LogEntryType::LogConfCommand as i32, 
                     data: "log_cmd".as_bytes().to_vec() 
                 },
                 LogEntry { 
@@ -218,6 +243,7 @@ mod tests {
 
         let request: RequestVoteRequest = RequestVoteRequest {
             term: 1,
+            disrupt_leader: false,
             candidate_id: "aws-node-1".to_string(),
             last_log_index: 10,
             last_log_term: 1,

@@ -3,7 +3,8 @@ package raft;
 
 enum LogEntryType {
     LogCommand = 0;
-    ConfCommand = 1;
+    LogConfCommand = 1;
+    LogNoOp = 2;
 }
 
 message LogEntry {
@@ -22,9 +23,8 @@ message AppendEntriesRequest {
     uint64 commit_index = 6;
 }
 
-message AppendEntriesResponse {
-    uint64 term = 1;
-    bool success = 2;
+message TimeoutNowRequest {
+    string leader_id = 2;
 }
 
 message RequestVoteRequest {
@@ -33,6 +33,7 @@ message RequestVoteRequest {
     uint64 last_log_index = 3;
     uint64 last_log_term = 4;
     uint64 commit_index = 5;
+    bool disrupt_leader = 6;
 }
 
 message RequestVoteResponse {
@@ -40,7 +41,18 @@ message RequestVoteResponse {
     bool vote_granted = 2;
 }
 
+message AppendEntriesResponse {
+    uint64 term = 1;
+    bool success = 2;
+}
+
+message TimeoutNowResponse {
+    uint64 term = 1;
+    bool success = 2;
+}
+
 service RaftGrpcTransport {
     rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
     rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+    rpc TimeoutNow(TimeoutNowRequest) returns (TimeoutNowResponse);
 }
