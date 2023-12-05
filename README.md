@@ -4,10 +4,21 @@ Rust Raft Implementation
 
 ![Flow Diagram](https://github.com/TheDhejavu/rust-raft/blob/main/public/rust-raft.png)
 
+
+[![Crates.io](https://img.shields.io/crates/l/rust-raft)](LICENSE)
+
+
+[Examples](https://github.com/TheDhejavu/rust-raft/tree/main/examples) | [Raft](https://raft.github.io)  | [Docs](https://github.com/TheDhejavu/rust-raft/tree/main/docs)
+
 ## Overview 
 
-**rust-raft** is a rust implementation of the Raft distributed consensus protocol ([Raft Website](https://raft.github.io)).
+**rust-raft** is a high performance, asynchronous rust implementation of the Raft distributed consensus protocol ([Raft Website](https://raft.github.io)).
  
+## Requirements
+- Programming Language: [Rust](https://www.rust-lang.org/)
+- Networking: [gRPC](https://github.com/hyperium/tonic)
+- Database: [Sled](https://github.com/spacejam/sled) 
+
 ### What is Raft?
 
 Raft is a consensus algorithm designed for distributed systems. It draws inspiration from the complexity of the Paxos consensus algorithm but aims to be more straightforward and intuitive. Raft is tailored to address non-Byzantine fault tolerance issues.
@@ -45,7 +56,7 @@ The Rust Raft implementation is designed to replicate a state machine (FSM) acro
 - Uses Channels for Communicating with the RaftNodeServer:
 The channel functions as an API layer for interacting with the RaftNodeServer, whether it's functioning as a leader or follower. It provides a structured way for components to communicate, facilitating seamless interaction and coordination within the Raft implementation
 
-- GRPC Communication Support for Nodes:
+- gRPC Communication Support for Nodes:
 The Raft nodes leverage gRPC (Google Remote Procedure Call) for communication. gRPC is a high-performance, open-source RPC framework that supports various programming languages. This choice of communication framework provides a robust and efficient layer for nodes to exchange messages and execute remote procedures, a critical aspect of implementing the Raft protocol.
 
 - Supports Single-Server Cluster Membership Changes and Leadership Transfer:
@@ -61,6 +72,10 @@ As a practical example, the project includes a basic Key-Value distributed datab
 - [x] Log Replication
 - [x] Cluster Membership Changes
 - [ ] Snapshotting / Log Compaction
+
+## Getting Started
+
+Examples can be found in [`examples`]
 
 
 ## Resources
