@@ -10,8 +10,7 @@ Raft is primarily split into three roles: **Leader**, **Follower**, and **Candid
 3. **Follower:** This represents the initial state of nodes within the Raft cluster. As followers, nodes serve as integral members of the cluster, primarily responsible for storing replicated logs. They also apply changes from these logs to their local state machines, ensuring redundancy. This makes them crucial for the system's resilience, as they can step in and participate in leader elections should the current leader fail, thereby making the system fault-tolerance.
 
 ![Screen Shot 2023-09-06 at 12.32.42 PM.png](https://github.com/TheDhejavu/rust-raft/blob/main/public/raftstate.png)
-
-*high-level diagram of how states transition works in raft.* 
+                        *high-level diagram of how states transition works in raft.* 
 
 ### Persisted states on all servers:
 
