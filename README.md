@@ -12,7 +12,7 @@ Rust Raft Implementation
 
 ## Overview 
 
-**rust-raft** is a high performance, asynchronous rust implementation of the Raft distributed consensus protocol ([Raft Website](https://raft.github.io)).
+**rust-raft** is a high performance, asynchronous rust implementation of the Raft distributed consensus protocol.
  
 ## Requirements
 - Programming Language: [Rust](https://www.rust-lang.org/)
@@ -57,7 +57,7 @@ The Rust Raft implementation is designed to replicate a state machine (FSM) acro
 The channel functions as an API layer for interacting with the RaftNodeServer, whether it's functioning as a leader or follower. It provides a structured way for components to communicate, facilitating seamless interaction and coordination within the Raft implementation
 
 - gRPC Communication Support for Nodes:
-The Raft nodes leverage gRPC (Google Remote Procedure Call) for communication. gRPC is a high-performance, open-source RPC framework that supports various programming languages. This choice of communication framework provides a robust and efficient layer for nodes to exchange messages and execute remote procedures, a critical aspect of implementing the Raft protocol.
+The Raft nodes leverage gRPC (Google Remote Procedure Call) for communication. This choice of communication framework provides a robust and efficient layer for nodes within the cluster to exchange messages and execute remote procedures, a critical aspect of implementing the Raft protocol.
 
 - Supports Single-Server Cluster Membership Changes and Leadership Transfer:
 The Raft implementation boasts the capability to dynamically handle changes in cluster membership. This includes scenarios such as adding or removing nodes from the cluster. Additionally, the system supports leadership transfer, allowing a node to gracefully hand over leadership to another node when necessary. 
