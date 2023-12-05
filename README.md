@@ -7,13 +7,15 @@ Rust Raft Implementation
 
 [![Crates.io](https://img.shields.io/crates/l/rust-raft)](LICENSE)
 
-
 [Examples](https://github.com/TheDhejavu/rust-raft/tree/main/examples) | [Raft](https://raft.github.io)  | [Docs](https://github.com/TheDhejavu/rust-raft/tree/main/docs)
 
 ## Overview 
 
 **rust-raft** is a high performance, asynchronous rust implementation of the Raft distributed consensus protocol.
- 
+
+![Raft module](https://github.com/TheDhejavu/rust-raft/blob/main/public/raft-overview.png)
+
+
 ## Requirements
 - Programming Language: [Rust](https://www.rust-lang.org/)
 - Networking: [gRPC](https://github.com/hyperium/tonic)
