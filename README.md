@@ -154,19 +154,19 @@ async fn main() {
 Clone repository 
 
     git clone https://github.com/TheDhejavu/rust-raft
-    
+
 ## Step 2
 Run server commmands
 
-Node 0(5000)
+`Node 0(5000)`
 
     cargo run --example rust-raft start --addr=127.0.0.1:5000 --peers=127.0.0.1:5000,127.0.0.1:5001,127.0.0.1:5002 --id=node-aws-0 --http-port=9090
 
-Node 1(5001)
+`Node 1(5001)`
 
     cargo run --example rust-raft start --addr=127.0.0.1:5001 --peers=127.0.0.1:5000,127.0.0.1:5001,127.0.0.1:5002 --id=node-aws-1 --http-port=8080
 
-Node 2(5002)
+`Node 2(5002)`
 
     cargo run --example rust-raft start --addr=127.0.0.1:5002 --peers=127.0.0.1:5000,127.0.0.1:5001,127.0.0.1:5002 --id=node-aws-2 --http-port=7070
 
