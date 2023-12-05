@@ -63,7 +63,7 @@ The Raft nodes leverage gRPC (Google Remote Procedure Call) for communication. T
 The Raft implementation boasts the capability to dynamically handle changes in cluster membership. This includes scenarios such as adding or removing nodes from the cluster. Additionally, the system supports leadership transfer, allowing a node to gracefully hand over leadership to another node when necessary. 
 
 - Basic K-V Distributed Database in `/examples` for Executing Multiple Write-Requests on the Leader:
-As a practical example, the project includes a basic Key-Value distributed database located in the `/examples`` directory. This database serves to showcase the Raft implementation's ability to execute multiple write requests concurrently on the Raft leader node. This demonstration emphasizes the practical application of Raft, highlighting its capacity to handle concurrent writes, maintain consistency, and ensure data integrity across the distributed system.
+As a practical example, the project includes a basic Key-Value distributed database located in the `/examples` directory. This database serves to showcase the Raft implementation's ability to execute multiple write requests concurrently on the Raft leader node. This demonstration emphasizes the practical application of Raft, highlighting its capacity to handle concurrent writes, maintain consistency, and ensure data integrity across the distributed system.
 
 
 ## Raft Consensus Algorithm Features
