@@ -9,9 +9,9 @@ Raft is primarily split into three roles: **Leader**, **Follower**, and **Candid
 2. **Candidate**: This is the state before the leader;; this state is triggered by the election timeout that forces a new election to start when there is no leader in sight, and it is also possible to have multiple candidates simultaneously. This situation can arise during leader elections when multiple followers times out without receiving heartbeats from a leader and then decide to promote themselves to candidates. Each candidate will then increment its current term, vote for itself, and send **`RequestVote`** RPCs to other nodes in the cluster.
 3. **Follower:** This represents the initial state of nodes within the Raft cluster. As followers, nodes serve as integral members of the cluster, primarily responsible for storing replicated logs. They also apply changes from these logs to their local state machines, ensuring redundancy. This makes them crucial for the system's resilience, as they can step in and participate in leader elections should the current leader fail, thereby making the system fault-tolerance.
 
-![Screen Shot 2023-09-06 at 12.32.42 PM.png](https://github.com/TheDhejavu/rust-raft/blob/main/public/raftstate.png))
+![Screen Shot 2023-09-06 at 12.32.42 PM.png](https://github.com/TheDhejavu/rust-raft/blob/main/public/raftstate.png)
 
-                           *high-level diagram of how states transition works in raft.* 
+*high-level diagram of how states transition works in raft.* 
 
 ### Persisted states on all servers:
 
