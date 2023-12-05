@@ -2,7 +2,7 @@
 
 Rust Raft Implementation
 
-![Flow Diagram](https://github.com/TheDhejavu/rust-raft/blob/main/public/rust-raft.png)
+<!-- ![Flow Diagram](https://github.com/TheDhejavu/rust-raft/blob/main/public/rust-raft.png) -->
 
 
 [![Crates.io](https://img.shields.io/crates/l/rust-raft)](LICENSE)
