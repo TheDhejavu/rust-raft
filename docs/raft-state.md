@@ -9,7 +9,7 @@ Raft is primarily split into three roles: **Leader**, **Follower**, and **Candid
 2. **Candidate**: This is the state before the leader;; this state is triggered by the election timeout that forces a new election to start when there is no leader in sight, and it is also possible to have multiple candidates simultaneously. This situation can arise during leader elections when multiple followers times out without receiving heartbeats from a leader and then decide to promote themselves to candidates. Each candidate will then increment its current term, vote for itself, and send **`RequestVote`** RPCs to other nodes in the cluster.
 3. **Follower:** This represents the initial state of nodes within the Raft cluster. As followers, nodes serve as integral members of the cluster, primarily responsible for storing replicated logs. They also apply changes from these logs to their local state machines, ensuring redundancy. This makes them crucial for the system's resilience, as they can step in and participate in leader elections should the current leader fail, thereby making the system fault-tolerance.
 
-![Screen Shot 2023-09-06 at 12.32.42 PM.png](Raft%20what%20is%20it%20c0dd1fd0562840d29cc1613de9f16d3f/Screen_Shot_2023-09-06_at_12.32.42_PM.png)
+![Screen Shot 2023-09-06 at 12.32.42 PM.png](https://github.com/TheDhejavu/rust-raft/blob/main/public/raftstate.png))
 
                            *high-level diagram of how states transition works in raft.* 
 
@@ -57,9 +57,9 @@ $$
 2. **MatchIndex:** 
     - For each follower, the leader maintains a **`MatchIndex`,** which indicates the highest log index where the leader and follower logs are consistent.
     
-    $$
-    MatchIndex+1≤NextIndex
-    $$
+$$
+MatchIndex+1≤NextIndex
+$$
     
 
 > *The formular above indicates that at every point in time matchIndex will always be less than nextIndex and in most cases we expect MatchIndex + 1 to be equal to NextIndex*
