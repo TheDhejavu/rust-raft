@@ -138,7 +138,7 @@ async fn main() {
             // Run the server.
             let addr = format!("127.0.0.1:{}", http_port.to_string());
           
-            // Start Raft node, GRPC server and API API
+            // Start RaftNode, GRPC server and API API
             _ = tokio::join!(
                 raft_node.run(),
                 grpc_server.run(server_addr),
